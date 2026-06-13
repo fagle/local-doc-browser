@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Local Doc Browser</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Markdown 文件列表">
+        <div class="brand">
+          <div>
+            <h1>Local Doc Browser</h1>
+            <p>本地文档与源码预览器</p>
+          </div>
+          <div class="brand-actions">
+            <button id="recentToggle" class="recent-button" type="button">最近</button>
+            <button id="themeToggle" class="icon-button" type="button" title="切换主题" aria-label="切换主题">
+              <span aria-hidden="true">◐</span>
+            </button>
+          </div>
+        </div>
+
+        <div id="recentPopover" class="recent-popover" hidden>
+          <div class="recent-header">
+            <span>最近打开</span>
+            <button id="clearRecent" type="button">清空</button>
+          </div>
+          <div id="recentList" class="recent-list"></div>
+        </div>
+
+        <div class="toolbar">
+          <input id="folderPath" class="path-input" type="text" placeholder="D:\docs" autocomplete="off" />
+          <button id="openFolder" class="primary-button" type="button">打开路径</button>
+        </div>
+
+        <label class="search-box" for="searchInput">
+          <span aria-hidden="true">⌕</span>
+          <input id="searchInput" type="search" placeholder="搜索文件名或正文" autocomplete="off" />
+        </label>
+
+        <div class="file-meta">
+          <span id="fileCount">未打开文件夹</span>
+          <button id="closeWorkspace" type="button">关闭</button>
+        </div>
+
+        <nav id="fileList" class="file-list" aria-label="文档"></nav>
+      </aside>
+
+      <main class="preview-panel">
+        <header class="preview-header">
+          <div>
+            <p id="docPath" class="doc-path">未选择文档</p>
+            <h2 id="docTitle">打开一个 Markdown 文件夹</h2>
+          </div>
+          <div class="preview-actions">
+            <div id="htmlMode" class="segmented-control" hidden>
+              <button id="htmlPreviewMode" class="active" type="button">预览</button>
+              <button id="htmlSourceMode" type="button">源码</button>
+            </div>
+            <button id="copyMarkdown" type="button">复制源码</button>
+            <button id="downloadHtml" type="button">下载 HTML</button>
+          </div>
+        </header>
+
+        <article id="preview" class="markdown-preview" tabindex="0"></article>
+      </main>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

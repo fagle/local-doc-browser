@@ -1,0 +1,9 @@
+{
+  "name": "local-doc-browser",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --watch dev-server.mjs 5173"
+  }
+}
