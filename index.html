@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Local Doc Browser</title>
+    <title>可米 KomiOS</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
@@ -11,11 +11,12 @@
       <aside class="sidebar" aria-label="Markdown 文件列表">
         <div class="brand">
           <div>
-            <h1>Local Doc Browser</h1>
-            <p>本地文档与源码预览器</p>
+            <h1>可米 KomiOS</h1>
+            <p>NAS 私有内容桌面</p>
           </div>
           <div class="brand-actions">
             <button id="recentToggle" class="recent-button" type="button">最近</button>
+            <button id="logout" class="recent-button" type="button">退出</button>
             <button id="themeToggle" class="icon-button" type="button" title="切换主题" aria-label="切换主题">
               <span aria-hidden="true">◐</span>
             </button>
@@ -48,6 +49,8 @@
         <nav id="fileList" class="file-list" aria-label="文档"></nav>
       </aside>
 
+      <div id="splitter" class="splitter" role="separator" aria-orientation="vertical" aria-label="调整列表宽度" tabindex="0"></div>
+
       <main class="preview-panel">
         <header class="preview-header">
           <div>
@@ -61,6 +64,9 @@
             </div>
             <button id="copyMarkdown" type="button">复制源码</button>
             <button id="downloadHtml" type="button">下载 HTML</button>
+            <button id="mediaInfo" type="button" hidden>编码信息</button>
+            <button id="transcodeVideo" type="button" hidden>转码播放</button>
+            <button id="downloadFile" type="button">下载</button>
           </div>
         </header>
 

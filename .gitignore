@@ -1,0 +1,9 @@
+.app-password
+.last-workspace
+data/
+node_modules/
+*.log
+*.log.err
+test-fixtures/heic-*.jpg
+test-fixtures/preview-*.jpg
+test-fixtures/near-mov/

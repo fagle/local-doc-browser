@@ -1,9 +1,13 @@
 {
-  "name": "local-doc-browser",
+  "name": "komios",
   "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node --watch dev-server.mjs 5173"
+    "start": "node dev-server.mjs 5173",
+    "dev": "node --watch dev-server.mjs 5173"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1"
   }
 }

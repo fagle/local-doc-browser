@@ -1,0 +1,18 @@
+services:
+  komios:
+    build: .
+    image: komios:latest
+    container_name: komios
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-5173}:5173"
+    environment:
+      PORT: "5173"
+      WORKSPACE: /workspace
+      CONFIG_DIR: /config
+      TRANSCODE_ACCEL: "${TRANSCODE_ACCEL:-auto}"
+      APP_USERNAME: "${APP_USERNAME:-admin}"
+      APP_PASSWORD: "${APP_PASSWORD:-}"
+    volumes:
+      - "${WORKSPACE_PATH:-/mnt/user}:/workspace"
+      - "${CONFIG_PATH:-./data}:/config"
