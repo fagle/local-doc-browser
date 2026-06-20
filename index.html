@@ -31,9 +31,15 @@
           <div id="recentList" class="recent-list"></div>
         </div>
 
-        <div class="toolbar">
-          <input id="folderPath" class="path-input" type="text" placeholder="D:\docs" autocomplete="off" />
-          <button id="openFolder" class="primary-button" type="button">打开路径</button>
+        <div class="path-panel">
+          <div class="path-navigator" aria-label="当前路径">
+            <div id="pathBreadcrumbs" class="path-breadcrumbs"></div>
+            <button id="editPath" class="path-edit-button" type="button">更改</button>
+          </div>
+          <div id="pathEditor" class="path-editor">
+            <input id="folderPath" class="path-input" type="text" placeholder="D:\docs" autocomplete="off" />
+            <button id="openFolder" class="primary-button" type="button">打开</button>
+          </div>
         </div>
 
         <label class="search-box" for="searchInput">
@@ -46,7 +52,28 @@
           <button id="closeWorkspace" type="button">关闭</button>
         </div>
 
+        <div class="mobile-album-nav" aria-label="移动端相册导航">
+          <button id="mobileAlbumToggle" type="button">相册</button>
+          <button id="mobileAlbumBrowse" type="button">切换</button>
+          <span id="mobileAlbumLabel"></span>
+        </div>
+
+        <div id="parentNav" class="parent-nav" aria-label="上级目录"></div>
         <nav id="fileList" class="file-list" aria-label="文档"></nav>
+
+        <div id="mobileAlbumSheet" class="mobile-album-sheet" hidden>
+          <button id="mobileAlbumScrim" class="mobile-album-scrim" type="button" aria-label="关闭相册切换"></button>
+          <section class="mobile-album-panel" aria-label="切换相册">
+            <header class="mobile-album-header">
+              <div>
+                <span>相册</span>
+                <strong>切换文件夹</strong>
+              </div>
+              <button id="mobileAlbumClose" type="button">关闭</button>
+            </header>
+            <div id="mobileAlbumContent" class="mobile-album-content"></div>
+          </section>
+        </div>
       </aside>
 
       <div id="splitter" class="splitter" role="separator" aria-orientation="vertical" aria-label="调整列表宽度" tabindex="0"></div>
@@ -74,6 +101,6 @@
       </main>
     </div>
 
-    <script src="./app.js"></script>
+    <script type="module" src="./app.js"></script>
   </body>
 </html>

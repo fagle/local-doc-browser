@@ -1,12 +1,24 @@
 import { createReadStream, createWriteStream, existsSync, watch } from "node:fs";
 import { spawn } from "node:child_process";
-import { createHash, pbkdf2Sync, randomBytes, timingSafeEqual } from "node:crypto";
-import { mkdir, mkdtemp, open, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { platform, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, normalize, parse, relative, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
-import Database from "better-sqlite3";
+import { fileKind, fileMime, ignoredDirectoryNames, staticTypes } from "./server/file-types.mjs";
+import { escapeHtml, readBody, sendHtml, sendJson } from "./server/http-utils.mjs";
+import { displayPath, normalizeInputPath } from "./server/path-utils.mjs";
+import { createApiRouter } from "./server/router.mjs";
+import { createAuthController } from "./server/auth.mjs";
+import { createIndexStatements, openIndexDatabase } from "./server/index-db.mjs";
+import { createKeyedTaskQueue } from "./server/task-queue.mjs";
+import {
+  cacheDirectoryUsage,
+  createCacheCleanupScheduler,
+  parseByteSize,
+  touchCacheFile,
+} from "./server/cache-utils.mjs";
 
 const appRoot = resolve(import.meta.dirname);
 const defaultWorkspacePath = appRoot;
@@ -16,83 +28,25 @@ let workspaceRoot = await resolveInitialWorkspace(process.argv[3]);
 const liveReloadClients = new Set();
 const appUsername = String(process.env.APP_USERNAME || "admin");
 const passwordFilePath = join(appRoot, ".app-password");
-const sessionCookieName = "ldb_session";
-const sessionMaxAgeSeconds = 7 * 24 * 60 * 60;
 const mediaInfoCache = new Map();
+const maxMediaInfoMemoryCacheItems = 512;
 const workspacePayloadCache = new Map();
 const maxWorkspacePayloadCacheSize = 32;
+const privateStaticRoots = new Set(["data", "node_modules", "server"]);
 const configRoot = normalizeInputPath(process.env.CONFIG_DIR || join(appRoot, "data"));
 const thumbnailRoot = join(configRoot, "thumbs");
+const previewRoot = join(configRoot, "previews");
 const thumbnailSize = Math.max(80, Math.min(512, Number(process.env.THUMBNAIL_SIZE || 192) || 192));
-const db = await openIndexDatabase();
-const sessions = new Map();
-
-const staticTypes = {
-  ".html": "text/html;charset=utf-8",
-  ".css": "text/css;charset=utf-8",
-  ".js": "text/javascript;charset=utf-8",
-  ".md": "text/markdown;charset=utf-8",
-};
-
-async function resolveBootstrapPassword() {
-  if (process.env.APP_PASSWORD) return String(process.env.APP_PASSWORD);
-
-  try {
-    const savedPassword = (await readFile(passwordFilePath, "utf8")).trim();
-    if (savedPassword) return savedPassword;
-  } catch {
-    // No saved password yet; generate one below.
-  }
-
-  const generatedPassword = randomBytes(18).toString("base64url");
-  await writeFile(passwordFilePath, generatedPassword, { mode: 0o600 });
-  return generatedPassword;
-}
-
-function hashPassword(password, salt = randomBytes(16).toString("base64url"), iterations = 210000) {
-  const passwordHash = pbkdf2Sync(String(password), salt, iterations, 32, "sha256").toString("base64url");
-  return { passwordHash, salt, iterations };
-}
-
-function hashSessionToken(token) {
-  return createHash("sha256").update(String(token)).digest("base64url");
-}
-
-function safeEqualText(left, right) {
-  const leftBuffer = Buffer.from(String(left));
-  const rightBuffer = Buffer.from(String(right));
-  if (leftBuffer.length !== rightBuffer.length) return false;
-  return timingSafeEqual(leftBuffer, rightBuffer);
-}
-
-async function initializeAuthState() {
-  const configuredPassword = process.env.APP_PASSWORD ? String(process.env.APP_PASSWORD) : "";
-  const existingUser = indexStatements.authUserByUsername.get(appUsername);
-
-  if (existingUser && !configuredPassword) {
-    return {
-      source: "sqlite",
-      username: existingUser.username,
-      user: existingUser,
-    };
-  }
-
-  const password = configuredPassword || (await resolveBootstrapPassword());
-  const hashed = hashPassword(password);
-  indexStatements.upsertAuthUser.run({
-    username: appUsername,
-    password_hash: hashed.passwordHash,
-    password_salt: hashed.salt,
-    password_iterations: hashed.iterations,
-    updated_at: Date.now(),
-  });
-
-  return {
-    source: configuredPassword ? "APP_PASSWORD migrated to sqlite" : existingUser ? "password file migrated to sqlite" : "generated password migrated to sqlite",
-    username: appUsername,
-    user: indexStatements.authUserByUsername.get(appUsername),
-  };
-}
+const thumbnailConcurrency = Math.max(1, Math.min(4, Number(process.env.THUMBNAIL_CONCURRENCY || 3) || 3));
+const previewConcurrency = Math.max(1, Math.min(4, Number(process.env.PREVIEW_CONCURRENCY || 3) || 3));
+const thumbnailCacheMaxBytes = parseByteSize(process.env.THUMBNAIL_CACHE_MAX || process.env.THUMBNAIL_CACHE_MAX_BYTES, 1024 * 1024 * 1024);
+const previewCacheMaxBytes = parseByteSize(process.env.PREVIEW_CACHE_MAX || process.env.PREVIEW_CACHE_MAX_BYTES, 5 * 1024 * 1024 * 1024);
+const previewCacheFormat = String(process.env.PREVIEW_CACHE_FORMAT || "webp").toLowerCase() === "jpeg" ? "jpeg" : "webp";
+const previewWebpQuality = Math.max(50, Math.min(95, Number(process.env.PREVIEW_WEBP_QUALITY || 82) || 82));
+const { scheduleCacheCleanup } = createCacheCleanupScheduler();
+const db = await openIndexDatabase({ configRoot, previewRoot, thumbnailRoot });
+const thumbnailQueue = createKeyedTaskQueue({ concurrency: thumbnailConcurrency });
+const previewQueue = createKeyedTaskQueue({ concurrency: previewConcurrency });
 
 async function resolveInitialWorkspace(argumentPath) {
   if (argumentPath) return normalizeInputPath(argumentPath);
@@ -114,486 +68,21 @@ async function rememberWorkspace(path) {
   }
 }
 
-const textExtensions = new Set([
-  ".bat",
-  ".bash",
-  ".c",
-  ".cmd",
-  ".conf",
-  ".cpp",
-  ".cs",
-  ".css",
-  ".csv",
-  ".env",
-  ".go",
-  ".h",
-  ".hpp",
-  ".htm",
-  ".html",
-  ".ini",
-  ".java",
-  ".js",
-  ".json",
-  ".jsonc",
-  ".jsx",
-  ".kt",
-  ".kts",
-  ".log",
-  ".markdown",
-  ".md",
-  ".mjs",
-  ".nfo",
-  ".php",
-  ".ps1",
-  ".py",
-  ".rb",
-  ".rs",
-  ".sh",
-  ".sql",
-  ".srt",
-  ".swift",
-  ".toml",
-  ".ts",
-  ".tsx",
-  ".txt",
-  ".vue",
-  ".vtt",
-  ".xml",
-  ".yaml",
-  ".yml",
-]);
-
-const textFilenames = new Set([
-  ".dockerignore",
-  ".editorconfig",
-  ".env",
-  ".env.example",
-  ".gitattributes",
-  ".gitignore",
-  ".nomedia",
-  ".npmrc",
-  "dockerfile",
-  "license",
-  "makefile",
-  "readme",
-]);
-
-const imageTypes = new Map([
-  [".avif", "image/avif"],
-  [".bmp", "image/bmp"],
-  [".gif", "image/gif"],
-  [".heic", "image/heic"],
-  [".heics", "image/heic-sequence"],
-  [".heif", "image/heif"],
-  [".heifs", "image/heif-sequence"],
-  [".ico", "image/x-icon"],
-  [".jpeg", "image/jpeg"],
-  [".jpg", "image/jpeg"],
-  [".png", "image/png"],
-  [".svg", "image/svg+xml"],
-  [".webp", "image/webp"],
-]);
-
-const mediaTypes = new Map([
-  [".aac", "audio/aac"],
-  [".flac", "audio/flac"],
-  [".m4a", "audio/mp4"],
-  [".mp3", "audio/mpeg"],
-  [".oga", "audio/ogg"],
-  [".ogg", "audio/ogg"],
-  [".wav", "audio/wav"],
-  [".m4v", "video/mp4"],
-  [".mkv", "video/x-matroska"],
-  [".mov", "video/quicktime"],
-  [".mp4", "video/mp4"],
-  [".ogv", "video/ogg"],
-  [".webm", "video/webm"],
-]);
-
-const fileTypes = new Map([
-  ...imageTypes,
-  ...mediaTypes,
-  [".7z", "application/x-7z-compressed"],
-  [".doc", "application/msword"],
-  [".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
-  [".gz", "application/gzip"],
-  [".pdf", "application/pdf"],
-  [".ppt", "application/vnd.ms-powerpoint"],
-  [".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"],
-  [".rar", "application/vnd.rar"],
-  [".tar", "application/x-tar"],
-  [".xls", "application/vnd.ms-excel"],
-  [".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
-  [".zip", "application/zip"],
-  [".css", "text/css;charset=utf-8"],
-  [".csv", "text/csv;charset=utf-8"],
-  [".htm", "text/html;charset=utf-8"],
-  [".html", "text/html;charset=utf-8"],
-  [".js", "text/javascript;charset=utf-8"],
-  [".json", "application/json;charset=utf-8"],
-  [".md", "text/markdown;charset=utf-8"],
-  [".mjs", "text/javascript;charset=utf-8"],
-  [".txt", "text/plain;charset=utf-8"],
-  [".xml", "application/xml;charset=utf-8"],
-]);
-
-const ignoredDirectoryNames = new Set([
-  ".git",
-  ".gradle",
-  ".modelscope-cache",
-  ".mypy_cache",
-  ".pytest_cache",
-  ".ruff_cache",
-  ".venv",
-  "__pycache__",
-  "node_modules",
-]);
-
-function isWindowsDrivePath(value) {
-  return /^[a-zA-Z]:[\\/]/.test(value);
-}
-
-function normalizeInputPath(value) {
-  const rawPath = String(value || "").trim();
-  if (!rawPath) return "";
-
-  if (platform() !== "win32") {
-    const legacyMount = process.env.LEGACY_NAS_MOUNT || "";
-    const mappedMount = process.env.LEGACY_NAS_MAPPED_MOUNT || "";
-    if (legacyMount && mappedMount && (rawPath === legacyMount || rawPath.startsWith(`${legacyMount}/`))) {
-      const rest = rawPath.slice(legacyMount.length).replace(/^\/+/, "");
-      const mountedDrivePath = resolve(mappedMount, rest);
-      if (existsSync(mountedDrivePath)) return mountedDrivePath;
-    }
-  }
-
-  if (platform() === "win32") {
-    const legacyMount = process.env.LEGACY_NAS_MOUNT || "";
-    const windowsNasDrive = process.env.WINDOWS_NAS_DRIVE || "";
-    if (legacyMount && windowsNasDrive && (rawPath === legacyMount || rawPath.startsWith(`${legacyMount}/`))) {
-      const rest = rawPath.slice(legacyMount.length).replace(/^\/+/, "").replaceAll("/", "\\");
-      return resolve(windowsNasDrive, rest);
-    }
-  }
-
-  if (platform() !== "win32" && isWindowsDrivePath(rawPath)) {
-    const drive = rawPath[0].toLowerCase();
-    const rest = rawPath.slice(2).replaceAll("\\", "/").replace(/^\/+/, "");
-    const mountedDrivePath = resolve(`/mnt/${drive}/${rest}`);
-    if (existsSync(mountedDrivePath)) return mountedDrivePath;
-
-    const configuredMount = process.env[`WSL_DRIVE_${drive.toUpperCase()}`] || process.env[`WINDOWS_DRIVE_${drive.toUpperCase()}`];
-    if (configuredMount) {
-      const configuredPath = resolve(configuredMount, rest);
-      if (existsSync(configuredPath)) return configuredPath;
-    }
-
-    const fallbackMount = process.env.WINDOWS_DRIVE_FALLBACK_MOUNT || "";
-    if (fallbackMount) {
-      const fallbackPath = resolve(fallbackMount, rest);
-      if (existsSync(fallbackPath)) return fallbackPath;
-    }
-
-    return mountedDrivePath;
-  }
-
-  return resolve(rawPath);
-}
-
-function displayPath(value) {
-  if (platform() !== "win32") {
-    const match = value.match(/^\/mnt\/([a-zA-Z])(?:\/(.*))?$/);
-    if (match) {
-      const drive = match[1].toUpperCase();
-      const rest = (match[2] || "").replaceAll("/", "\\");
-      return rest ? `${drive}:\\${rest}` : `${drive}:\\`;
-    }
-  }
-
-  return value;
-}
-
-function sendJson(response, status, payload) {
-  response.writeHead(status, { "content-type": "application/json;charset=utf-8" });
-  response.end(JSON.stringify(payload));
-}
-
-function sendHtml(response, status, html) {
-  response.writeHead(status, { "content-type": "text/html;charset=utf-8" });
-  response.end(html);
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
-}
-
-function safeNextPath(value) {
-  const next = String(value || "/");
-  if (!next.startsWith("/") || next.startsWith("//") || next.includes("\\") || next.includes("\n") || next.includes("\r")) return "/";
-  return next;
-}
-
-function loginPage(error = "", next = "/") {
-  const safeNext = safeNextPath(next);
-  return `<!doctype html>
-<html lang="zh-CN">
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>登录 · 可米 KomiOS</title>
-<style>
-  :root { color-scheme: light; --bg:#f6f7f9; --panel:#fff; --text:#1d252f; --muted:#687483; --line:#d9e0e7; --accent:#0f766e; }
-  * { box-sizing: border-box; }
-  body { display:grid; place-items:center; min-height:100vh; margin:0; background:var(--bg); color:var(--text); font-family:"Segoe UI","Microsoft YaHei",Arial,sans-serif; }
-  main { width:min(380px, calc(100vw - 32px)); padding:28px; border:1px solid var(--line); border-radius:8px; background:var(--panel); box-shadow:0 18px 45px rgba(30,41,59,.12); }
-  h1 { margin:0 0 6px; font-size:24px; }
-  p { margin:0 0 18px; color:var(--muted); font-size:14px; }
-  label { display:grid; gap:8px; color:var(--muted); font-size:13px; }
-  input { min-height:42px; padding:0 12px; border:1px solid var(--line); border-radius:8px; font:inherit; }
-  button { width:100%; min-height:42px; margin-top:14px; border:1px solid var(--accent); border-radius:8px; background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
-  .error { margin:0 0 12px; color:#b42318; }
-</style>
-<main>
-  <h1>可米 KomiOS</h1>
-  <p>请输入访问账号。</p>
-  ${error ? `<p class="error">${error}</p>` : ""}
-  <form method="post" action="/api/login">
-    <input name="next" type="hidden" value="${escapeHtml(safeNext)}">
-    <label>用户名
-      <input name="username" type="text" value="${escapeHtml(authState.username)}" autofocus autocomplete="username">
-    </label>
-    <label>密码
-      <input name="password" type="password" autocomplete="current-password">
-    </label>
-    <button type="submit">登录</button>
-  </form>
-</main>`;
-}
-
-function parseCookies(request) {
-  const cookies = new Map();
-  for (const part of String(request.headers.cookie || "").split(";")) {
-    const [rawName, ...rawValue] = part.trim().split("=");
-    if (!rawName) continue;
-    cookies.set(rawName, decodeURIComponent(rawValue.join("=") || ""));
-  }
-  return cookies;
-}
-
-function verifyLogin(username, password) {
-  if (!authState?.user) return false;
-  if (!safeEqualText(username, authState.user.username)) return false;
-  const actualPassword = hashPassword(password, authState.user.password_salt, authState.user.password_iterations);
-  return safeEqualText(actualPassword.passwordHash, authState.user.password_hash);
-}
-
-function authEnabled() {
-  return Boolean(authState?.user);
-}
-
-function isAuthenticated(request) {
-  if (!authEnabled()) return true;
-  const token = parseCookies(request).get(sessionCookieName);
-  if (!token) return false;
-  const now = Date.now();
-  const tokenHash = hashSessionToken(token);
-  let session = sessions.get(tokenHash);
-  if (!session) {
-    const persistedSession = indexStatements.authSessionByTokenHash.get(tokenHash);
-    if (persistedSession && persistedSession.expires_at > now) {
-      session = { expiresAt: persistedSession.expires_at, username: persistedSession.username };
-      sessions.set(tokenHash, session);
-    }
-  }
-  if (!session || session.expiresAt <= Date.now() || session.username !== authState.username) {
-    sessions.delete(tokenHash);
-    indexStatements.deleteAuthSession.run(tokenHash);
-    return false;
-  }
-  indexStatements.touchAuthSession.run({ token_hash: tokenHash, last_seen_at: now });
-  return true;
-}
-
-function createSession(response) {
-  const token = randomBytes(32).toString("base64url");
-  const tokenHash = hashSessionToken(token);
-  const now = Date.now();
-  const expiresAt = now + sessionMaxAgeSeconds * 1000;
-  sessions.set(tokenHash, { expiresAt, username: authState.username });
-  indexStatements.upsertAuthSession.run({
-    token_hash: tokenHash,
-    username: authState.username,
-    expires_at: expiresAt,
-    created_at: now,
-    last_seen_at: now,
-  });
-  response.setHeader("set-cookie", `${sessionCookieName}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${sessionMaxAgeSeconds}`);
-}
-
-function clearSession(request, response) {
-  const token = parseCookies(request).get(sessionCookieName);
-  if (token) {
-    const tokenHash = hashSessionToken(token);
-    sessions.delete(tokenHash);
-    indexStatements.deleteAuthSession.run(tokenHash);
-  }
-  response.setHeader("set-cookie", `${sessionCookieName}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
-}
-
-function wantsHtml(request) {
-  return String(request.headers.accept || "").includes("text/html");
-}
-
-function rejectUnauthenticated(request, response, url) {
-  if (url.pathname.startsWith("/api/")) {
-    sendJson(response, 401, { error: "未登录" });
-  } else if (wantsHtml(request)) {
-    response.writeHead(302, { location: `/login?next=${encodeURIComponent(`${url.pathname}${url.search}`)}` });
-    response.end();
-  } else {
-    response.writeHead(401, { "content-type": "text/plain;charset=utf-8" });
-    response.end("Unauthorized");
-  }
-}
-
 function sendLiveReload() {
   for (const client of liveReloadClients) {
     client.write("event: reload\ndata: changed\n\n");
   }
 }
 
-async function openIndexDatabase() {
-  await mkdir(configRoot, { recursive: true });
-  await mkdir(thumbnailRoot, { recursive: true });
-  const database = new Database(join(configRoot, "komios.db"));
-  database.pragma("journal_mode = WAL");
-  database.pragma("synchronous = NORMAL");
-  database.pragma("foreign_keys = ON");
-  database.exec(`
-    create table if not exists files (
-      path text primary key,
-      display_path text not null,
-      name text not null,
-      kind text not null,
-      mime text not null,
-      size integer,
-      mtime_ms real,
-      indexed_at integer not null
-    );
+const indexStatements = createIndexStatements(db);
 
-    create index if not exists files_kind_idx on files(kind);
-    create index if not exists files_indexed_at_idx on files(indexed_at);
-
-    create table if not exists media_info (
-      path text primary key references files(path) on delete cascade,
-      size integer not null,
-      mtime_ms real not null,
-      payload_json text not null,
-      probed_at integer not null
-    );
-
-    create table if not exists thumbnails (
-      path text primary key references files(path) on delete cascade,
-      size integer not null,
-      mtime_ms real not null,
-      thumb_path text not null,
-      width integer,
-      height integer,
-      generated_at integer not null
-    );
-
-    create table if not exists auth_users (
-      username text primary key,
-      password_hash text not null,
-      password_salt text not null,
-      password_iterations integer not null,
-      updated_at integer not null
-    );
-
-    create table if not exists auth_sessions (
-      token_hash text primary key,
-      username text not null references auth_users(username) on delete cascade,
-      expires_at integer not null,
-      created_at integer not null,
-      last_seen_at integer not null
-    );
-
-    create index if not exists auth_sessions_expires_at_idx on auth_sessions(expires_at);
-  `);
-  return database;
-}
-
-const indexStatements = {
-  fileByPath: db.prepare("select path, display_path, name, kind, mime, size, mtime_ms, indexed_at from files where path = ?"),
-  upsertFile: db.prepare(`
-    insert into files(path, display_path, name, kind, mime, size, mtime_ms, indexed_at)
-    values(@path, @display_path, @name, @kind, @mime, @size, @mtime_ms, @indexed_at)
-    on conflict(path) do update set
-      display_path = excluded.display_path,
-      name = excluded.name,
-      kind = excluded.kind,
-      mime = excluded.mime,
-      size = excluded.size,
-      mtime_ms = excluded.mtime_ms,
-      indexed_at = excluded.indexed_at
-  `),
-  mediaByPath: db.prepare("select payload_json, size, mtime_ms, probed_at from media_info where path = ?"),
-  upsertMedia: db.prepare(`
-    insert into media_info(path, size, mtime_ms, payload_json, probed_at)
-    values(@path, @size, @mtime_ms, @payload_json, @probed_at)
-    on conflict(path) do update set
-      size = excluded.size,
-      mtime_ms = excluded.mtime_ms,
-      payload_json = excluded.payload_json,
-      probed_at = excluded.probed_at
-  `),
-  thumbnailByPath: db.prepare("select thumb_path, size, mtime_ms, width, height, generated_at from thumbnails where path = ?"),
-  upsertThumbnail: db.prepare(`
-    insert into thumbnails(path, size, mtime_ms, thumb_path, width, height, generated_at)
-    values(@path, @size, @mtime_ms, @thumb_path, @width, @height, @generated_at)
-    on conflict(path) do update set
-      size = excluded.size,
-      mtime_ms = excluded.mtime_ms,
-      thumb_path = excluded.thumb_path,
-      width = excluded.width,
-      height = excluded.height,
-      generated_at = excluded.generated_at
-  `),
-  stats: db.prepare(`
-    select
-      (select count(*) from files) as files,
-      (select count(*) from media_info) as media,
-      (select count(*) from thumbnails) as thumbnails,
-      (select count(*) from auth_sessions where expires_at > unixepoch() * 1000) as activeSessions
-  `),
-  authUserByUsername: db.prepare("select username, password_hash, password_salt, password_iterations, updated_at from auth_users where username = ?"),
-  upsertAuthUser: db.prepare(`
-    insert into auth_users(username, password_hash, password_salt, password_iterations, updated_at)
-    values(@username, @password_hash, @password_salt, @password_iterations, @updated_at)
-    on conflict(username) do update set
-      password_hash = excluded.password_hash,
-      password_salt = excluded.password_salt,
-      password_iterations = excluded.password_iterations,
-      updated_at = excluded.updated_at
-  `),
-  authSessionByTokenHash: db.prepare("select token_hash, username, expires_at, created_at, last_seen_at from auth_sessions where token_hash = ?"),
-  upsertAuthSession: db.prepare(`
-    insert into auth_sessions(token_hash, username, expires_at, created_at, last_seen_at)
-    values(@token_hash, @username, @expires_at, @created_at, @last_seen_at)
-    on conflict(token_hash) do update set
-      username = excluded.username,
-      expires_at = excluded.expires_at,
-      last_seen_at = excluded.last_seen_at
-  `),
-  touchAuthSession: db.prepare("update auth_sessions set last_seen_at = @last_seen_at where token_hash = @token_hash"),
-  deleteAuthSession: db.prepare("delete from auth_sessions where token_hash = ?"),
-  deleteExpiredAuthSessions: db.prepare("delete from auth_sessions where expires_at <= ?"),
-};
-
-const authState = await initializeAuthState();
+const auth = createAuthController({
+  escapeHtml,
+  passwordFilePath,
+  statements: indexStatements,
+  username: appUsername,
+});
+const authState = await auth.initialize();
 indexStatements.deleteExpiredAuthSessions.run(Date.now());
 
 function indexedPathKey(target) {
@@ -647,6 +136,7 @@ function cachedThumbnail(target, targetStat) {
   const row = indexStatements.thumbnailByPath.get(indexedPathKey(target));
   if (!row || row.size !== targetStat.size || row.mtime_ms !== targetStat.mtimeMs) return null;
   if (!row.thumb_path || !existsSync(row.thumb_path)) return null;
+  touchCacheFile(row.thumb_path);
   return {
     generatedAt: row.generated_at,
     height: row.height || null,
@@ -670,35 +160,35 @@ function cacheThumbnail(target, targetStat, thumbPath, dimensions = {}) {
 }
 
 function setupLiveReload() {
-  const watchedFiles = ["index.html", "styles.css", "app.js", "README.md"];
+  const watchedFiles = [
+    "index.html",
+    "styles.css",
+    "app.js",
+    "client/deferred-list-metadata.js",
+    "client/desktop-shell.js",
+    "client/live-photo.js",
+    "client/mobile-album.js",
+    "client/media-model.js",
+    "client/navigation.js",
+    "client/photo-swipe.js",
+    "client/preview-renderers.js",
+    "client/text-renderer.js",
+    "client/utils.js",
+    "client/video-info-renderer.js",
+    "client/video-player.js",
+    "server/auth.mjs",
+    "server/cache-utils.mjs",
+    "server/file-types.mjs",
+    "server/http-utils.mjs",
+    "server/index-db.mjs",
+    "server/path-utils.mjs",
+    "server/router.mjs",
+    "server/task-queue.mjs",
+    "README.md",
+  ];
   for (const filename of watchedFiles) {
     watch(join(appRoot, filename), { persistent: false }, () => sendLiveReload());
   }
-}
-
-async function readBody(request) {
-  const chunks = [];
-  for await (const chunk of request) chunks.push(chunk);
-  return Buffer.concat(chunks).toString("utf8");
-}
-
-function fileKind(filename) {
-  const name = basename(filename).toLowerCase();
-  const extension = extname(filename).toLowerCase();
-  if (extension === ".md" || extension === ".markdown") return "markdown";
-  if (textFilenames.has(name)) return "text";
-  if (textExtensions.has(extension)) return "text";
-  if (imageTypes.has(extension)) return "image";
-  if (extension === ".pdf") return "pdf";
-  if ((mediaTypes.get(extension) || "").startsWith("audio/")) return "audio";
-  if ((mediaTypes.get(extension) || "").startsWith("video/")) return "video";
-  return "file";
-}
-
-function fileMime(filename) {
-  const name = basename(filename).toLowerCase();
-  if (textFilenames.has(name)) return "text/plain;charset=utf-8";
-  return fileTypes.get(extname(filename).toLowerCase()) || "application/octet-stream";
 }
 
 async function documentMetadata(relativePath, rootPath = "") {
@@ -707,18 +197,28 @@ async function documentMetadata(relativePath, rootPath = "") {
   if (!targetStat.isFile()) throw new Error("不是文件");
   cacheFileMetadata(target, targetStat);
   const name = basename(target);
+  const kind = fileKind(target);
   const rawUrl = fileUrl(relativePath, rootPath);
   return {
     id: relativePath,
     name,
     path: relativePath,
-    kind: fileKind(target),
+    kind,
     size: targetStat.size,
     mime: fileMime(target),
     rawUrl,
     previewUrl: needsImagePreview(target) ? imagePreviewUrl(relativePath, rootPath) : rawUrl,
     downloadUrl: `${rawUrl}${rawUrl.includes("?") ? "&" : "?"}download=1`,
   };
+}
+
+async function imageSizePayload(relativePath, rootPath = "") {
+  const target = documentPath(relativePath, rootPath);
+  const targetStat = await stat(target);
+  if (!targetStat.isFile()) throw new Error("不是文件");
+  if (fileKind(target) !== "image") throw new Error("不是图片文件");
+  cacheFileMetadata(target, targetStat);
+  return { path: relativePath, imageSize: await imageDisplaySize(target).catch(() => null) };
 }
 
 async function fileSizesPayload(paths, rootPath = "") {
@@ -791,6 +291,14 @@ function thumbnailFilename(target, targetStat) {
   return `${createHash("sha256").update(key).digest("hex").slice(0, 32)}.jpg`;
 }
 
+function previewFilename(target, targetStat, aspect = null, format = previewCacheFormat) {
+  const aspectKey = aspect ? `${aspect.width}x${aspect.height}` : "source";
+  const formatKey = format === "webp" ? `webp-q${previewWebpQuality}` : "jpeg";
+  const extension = format === "webp" ? "webp" : "jpg";
+  const key = `${indexedPathKey(target)}|${targetStat.size}|${targetStat.mtimeMs}|preview-v5|${aspectKey}|${formatKey}`;
+  return `${createHash("sha256").update(key).digest("hex").slice(0, 32)}.${extension}`;
+}
+
 function thumbnailFileUrl(thumbPath) {
   return `/api/thumb/${encodeURIComponent(basename(thumbPath))}`;
 }
@@ -798,7 +306,7 @@ function thumbnailFileUrl(thumbPath) {
 function imagePreviewUrl(relativePath, rootPath = "", options = {}) {
   const params = new URLSearchParams({ path: relativePath });
   if (rootPath) params.set("dir", rootPath);
-  params.set("v", "4");
+  params.set("v", "6");
   if (options.width && options.height) {
     params.set("fitWidth", String(options.width));
     params.set("fitHeight", String(options.height));
@@ -808,6 +316,28 @@ function imagePreviewUrl(relativePath, rootPath = "", options = {}) {
 
 function needsImagePreview(filename) {
   return [".heic", ".heif", ".heics", ".heifs"].includes(extname(filename).toLowerCase());
+}
+
+function previewFormatFromUrl(url) {
+  return String(url.searchParams.get("format") || previewCacheFormat).toLowerCase() === "jpeg" ? "jpeg" : "webp";
+}
+
+async function imageDisplaySize(target) {
+  if (!needsImagePreview(target)) return null;
+  const orientation = await heifOrientation(target).catch(() => null);
+  const width = Number(orientation?.codedWidth || 0);
+  const height = Number(orientation?.codedHeight || 0);
+  if (width > 0 && height > 0) {
+    const rotation = Number(orientation?.rotation || 0);
+    return Math.abs(rotation) % 180 === 90
+      ? { width: height, height: width, rotation }
+      : { width, height, rotation };
+  }
+
+  const output = await spawnBuffered("heif-info", [target], { timeoutMs: 4000 });
+  const match = output.toString("utf8").match(/\bimage:\s*(\d+)x(\d+)\b[^\n]*primary/i);
+  if (!match) return null;
+  return { width: Number(match[1]), height: Number(match[2]), source: "heif-info" };
 }
 
 function relativePathFromTarget(target, rootPath = "") {
@@ -858,12 +388,8 @@ async function existingSidecarVideo(target) {
 async function exactStemSidecarVideo(target) {
   const parsed = parse(target);
   const extensions = [".MOV", ".mov", ".MP4", ".mp4", ".M4V", ".m4v"];
-  const names = await readdir(parsed.dir).catch(() => []);
   for (const extension of extensions) {
-    const expected = `${parsed.name}${extension}`;
-    const exactName = names.find((name) => name.toLowerCase() === expected.toLowerCase());
-    if (!exactName) continue;
-    const candidate = join(parsed.dir, exactName);
+    const candidate = join(parsed.dir, `${parsed.name}${extension}`);
     if (candidate === target) continue;
     const candidateStat = await stat(candidate).catch(() => null);
     if (candidateStat?.isFile() && fileKind(candidate) === "video") return { target: candidate, stat: candidateStat };
@@ -875,20 +401,20 @@ function livePhotoSidecarPayload({ path, rootPath, sidecar, confidence, message,
   const videoPath = relativePathFromTarget(sidecar.target, rootPath);
   const transcodeParams = new URLSearchParams({ path: videoPath, start: "0" });
   if (rootPath) transcodeParams.set("dir", rootPath);
-  return videoDisplaySize(sidecar.target).then((displaySize) => ({
+  return {
     isLive: true,
     mode: "sidecar",
     confidence,
     label: "Live Photo",
-    previewUrl: displaySize ? imagePreviewUrl(path, rootPath, displaySize) : imagePreviewUrl(path, rootPath),
-    videoDisplaySize: displaySize,
+    previewUrl: imagePreviewUrl(path, rootPath),
+    videoDisplaySize: null,
     videoPath,
     videoUrl: fileUrl(videoPath, rootPath),
     transcodeUrl: `/api/transcode?${transcodeParams.toString()}`,
     videoSize: sidecar.stat.size,
     contentIdentifiers,
     message,
-  }));
+  };
 }
 
 function readIsoBoxes(buffer, start = 0, end = buffer.length) {
@@ -1398,6 +924,16 @@ async function livePhotoPayload(path, rootPath = "") {
   const extension = extname(target).toLowerCase();
   let summary = null;
   if ([".heic", ".heif", ".heics", ".heifs"].includes(extension)) {
+    const sidecar = await exactStemSidecarVideo(target);
+    if (sidecar) {
+      return livePhotoSidecarPayload({
+        path,
+        rootPath,
+        sidecar,
+        confidence: "exact-stem-sidecar",
+        message: "找到严格同名的 MOV/MP4 动态部分。",
+      });
+    }
     summary = await heifLivePhotoDetails(target).catch((error) => ({ error: error.message }));
   }
 
@@ -1411,20 +947,6 @@ async function livePhotoPayload(path, rootPath = "") {
         confidence: "content-identifier",
         message: "按 Apple Live Photo Content Identifier 找到配套 MOV/MP4。",
         contentIdentifiers: summary.contentIdentifiers,
-      });
-    }
-  }
-
-  if (summary?.hasApplePhotoMetadata) {
-    const sidecar = await exactStemSidecarVideo(target);
-    if (sidecar) {
-      return livePhotoSidecarPayload({
-        path,
-        rootPath,
-        sidecar,
-        confidence: "exact-stem-sidecar",
-        message: "找到严格同名的 MOV/MP4 动态部分。",
-        contentIdentifiers: summary.contentIdentifiers || [],
       });
     }
   }
@@ -1866,6 +1388,18 @@ async function heifConvertPreview(target) {
   }
 }
 
+async function heifConvertThumbnailSource(target) {
+  const tempDir = await mkdtemp(join(tmpdir(), "ldb-heic-thumb-"));
+  const output = join(tempDir, "preview.jpg");
+  try {
+    await spawnBuffered("heif-convert", ["-q", "72", target, output], { timeoutMs: 12000 });
+    const converted = await readFile(output);
+    return await applyHeifOrientationFallback(converted, target).catch(() => converted);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
 function fitAspectFromUrl(url) {
   const width = Number(url.searchParams.get("fitWidth") || 0);
   const height = Number(url.searchParams.get("fitHeight") || 0);
@@ -1891,6 +1425,34 @@ async function cropJpegToAspect(input, aspect) {
     "mjpeg",
     "pipe:1",
   ], { stdio: ["pipe", "pipe", "pipe"], input });
+}
+
+async function encodePreviewImage(input, format = previewCacheFormat) {
+  if (format !== "webp") {
+    return { buffer: input, contentType: "image/jpeg" };
+  }
+
+  const buffer = await spawnBuffered("ffmpeg", [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-f",
+    "mjpeg",
+    "-i",
+    "pipe:0",
+    "-frames:v",
+    "1",
+    "-c:v",
+    "libwebp",
+    "-quality",
+    String(previewWebpQuality),
+    "-compression_level",
+    "5",
+    "-f",
+    "webp",
+    "pipe:1",
+  ], { input, timeoutMs: 10000 });
+  return { buffer, contentType: "image/webp" };
 }
 
 async function squareJpegThumbnail(input) {
@@ -1978,45 +1540,115 @@ async function imagePreviewBuffer(target, options = {}) {
   throw new Error(errors.join(" | "));
 }
 
+async function imageThumbnailBuffer(target) {
+  const input = needsImagePreview(target)
+    ? await heifConvertThumbnailSource(target)
+    : await imagePreviewBuffer(target);
+  return squareJpegThumbnail(input);
+}
+
 async function generateThumbnail(target, targetStat) {
   const kind = fileKind(target);
   if (kind !== "image" && kind !== "video") throw new Error("此文件类型不支持缩略图");
   const thumbPath = join(thumbnailRoot, thumbnailFilename(target, targetStat));
   if (existsSync(thumbPath)) {
+    await touchCacheFile(thumbPath);
     cacheThumbnail(target, targetStat, thumbPath, { width: thumbnailSize, height: thumbnailSize });
     return cachedThumbnail(target, targetStat);
   }
 
   const output = kind === "image"
-    ? await squareJpegThumbnail(await imagePreviewBuffer(target))
+    ? await imageThumbnailBuffer(target)
     : await videoThumbnailBuffer(target);
   if (!output?.length) throw new Error("缩略图生成为空");
 
   await mkdir(thumbnailRoot, { recursive: true });
   await writeFile(thumbPath, output);
+  await touchCacheFile(thumbPath);
+  scheduleCacheCleanup("thumbnails", thumbnailRoot, thumbnailCacheMaxBytes);
   cacheThumbnail(target, targetStat, thumbPath, { width: thumbnailSize, height: thumbnailSize });
   return cachedThumbnail(target, targetStat);
 }
 
-async function thumbnailPayload(paths, rootPath = "") {
-  const requestedPaths = Array.isArray(paths) ? paths.slice(0, 8) : [];
-  const thumbnails = [];
-  for (const relativePath of requestedPaths) {
+async function thumbnailResult(relativePath, rootPath = "") {
+  const queueKey = `${scopedWorkspaceRoot(rootPath)}\0${relativePath}`;
+  return thumbnailQueue.run(queueKey, async () => {
     try {
-      const target = documentPath(relativePath, rootPath);
-      const targetStat = await stat(target);
-      if (!targetStat.isFile()) continue;
-      const kind = fileKind(target);
-      if (kind !== "image" && kind !== "video") continue;
-      cacheFileMetadata(target, targetStat);
-      const cached = cachedThumbnail(target, targetStat);
-      const thumbnail = cached || await generateThumbnail(target, targetStat);
-      thumbnails.push({ path: relativePath, thumbnailUrl: thumbnail.url, cached: Boolean(cached) });
+      return await uncachedThumbnailResult(relativePath, rootPath);
     } catch (error) {
-      thumbnails.push({ path: relativePath, error: error.message || "缩略图生成失败" });
+      return { path: relativePath, error: error.message || "缩略图生成失败" };
     }
-  }
+  });
+}
+
+async function uncachedThumbnailResult(relativePath, rootPath = "") {
+    const target = documentPath(relativePath, rootPath);
+    const targetStat = await stat(target);
+    if (!targetStat.isFile()) throw new Error("不是文件");
+    const kind = fileKind(target);
+    if (kind !== "image" && kind !== "video") throw new Error("此文件类型不支持缩略图");
+    cacheFileMetadata(target, targetStat);
+    const cached = cachedThumbnail(target, targetStat);
+    const thumbnail = cached || await generateThumbnail(target, targetStat);
+    const imageSize = kind === "image" ? await imageDisplaySize(target).catch(() => null) : null;
+    return { path: relativePath, thumbnailUrl: thumbnail.url, imageSize, cached: Boolean(cached) };
+}
+
+async function thumbnailPayload(paths, rootPath = "") {
+  const requestedPaths = Array.isArray(paths) ? paths.slice(0, 12) : [];
+  const thumbnails = await Promise.all(requestedPaths.map((relativePath) => thumbnailResult(relativePath, rootPath)));
   return { thumbnails };
+}
+
+async function sendThumbnailStream(response, paths, rootPath = "") {
+  const requestedPaths = Array.isArray(paths) ? paths.slice(0, 12) : [];
+  response.writeHead(200, {
+    "cache-control": "no-cache",
+    "content-type": "application/x-ndjson;charset=utf-8",
+  });
+
+  const pending = new Set();
+  for (const relativePath of requestedPaths) {
+    const promise = thumbnailResult(relativePath, rootPath);
+    const wrapped = promise.then((result) => ({ result, wrapped }));
+    pending.add(wrapped);
+  }
+  while (pending.size > 0) {
+    const settled = await Promise.race(pending);
+    pending.delete(settled.wrapped);
+    const { result } = settled;
+    response.write(`${JSON.stringify(result)}\n`);
+  }
+  response.end();
+}
+
+async function generateImagePreview(target, previewPath, format, aspect, priority = 0) {
+  return previewQueue.run(previewPath, async () => {
+    if (existsSync(previewPath)) {
+      await touchCacheFile(previewPath);
+      return readFile(previewPath);
+    }
+
+    const preview = await encodePreviewImage(await imagePreviewBuffer(target, { aspect }), format);
+    const image = preview.buffer;
+    await mkdir(previewRoot, { recursive: true });
+    const tempPath = `${previewPath}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+    try {
+      await writeFile(tempPath, image);
+      if (existsSync(previewPath)) {
+        await rm(tempPath, { force: true });
+        await touchCacheFile(previewPath);
+        return readFile(previewPath);
+      }
+      await rename(tempPath, previewPath);
+    } catch (error) {
+      await rm(tempPath, { force: true });
+      throw error;
+    }
+    await touchCacheFile(previewPath);
+    scheduleCacheCleanup("previews", previewRoot, previewCacheMaxBytes);
+    return image;
+  }, { priority });
 }
 
 async function handleImagePreview(request, response, url) {
@@ -2033,11 +1665,30 @@ async function handleImagePreview(request, response, url) {
     return true;
   }
 
-  const image = await imagePreviewBuffer(target, { aspect: fitAspectFromUrl(url) });
+  const aspect = fitAspectFromUrl(url);
+  const format = previewFormatFromUrl(url);
+  const priority = Math.max(0, Math.min(100, Number(url.searchParams.get("priority") || 0) || 0));
+  const previewPath = join(previewRoot, previewFilename(target, targetStat, aspect, format));
+  const contentType = format === "webp" ? "image/webp" : "image/jpeg";
+  let image;
+  if (existsSync(previewPath)) {
+    await touchCacheFile(previewPath);
+    image = await readFile(previewPath);
+  } else {
+    const cancelQueuedPreview = () => {
+      if (!response.writableEnded) previewQueue.cancel(previewPath, "preview request closed before generation started");
+    };
+    response.once("close", cancelQueuedPreview);
+    try {
+      image = await generateImagePreview(target, previewPath, format, aspect, priority);
+    } finally {
+      response.off("close", cancelQueuedPreview);
+    }
+  }
   response.writeHead(200, {
-    "cache-control": "private, max-age=3600",
+    "cache-control": "private, max-age=86400",
     "content-length": image.length,
-    "content-type": "image/jpeg",
+    "content-type": contentType,
   });
   response.end(image);
   return true;
@@ -2592,13 +2243,13 @@ async function mediaInfoPayload(path, rootPath = "") {
 
   const persisted = cachedMediaInfo(target, targetStat);
   if (persisted) {
-    mediaInfoCache.set(cacheKey, persisted);
+    rememberMediaInfo(cacheKey, persisted);
     return persisted;
   }
 
   try {
     const payload = await ffprobeMediaInfo(target, targetStat);
-    mediaInfoCache.set(cacheKey, payload);
+    rememberMediaInfo(cacheKey, payload);
     cacheMediaInfo(target, targetStat, payload);
     return payload;
   } catch (error) {
@@ -2610,7 +2261,7 @@ async function mediaInfoPayload(path, rootPath = "") {
         tracks: [],
         warning: `无法探测此容器：${error.message || "ffprobe 不可用"}`,
       };
-      mediaInfoCache.set(cacheKey, payload);
+      rememberMediaInfo(cacheKey, payload);
       cacheMediaInfo(target, targetStat, payload);
       return payload;
     }
@@ -2622,7 +2273,7 @@ async function mediaInfoPayload(path, rootPath = "") {
       : payload.isPartialInspection
         ? `ffprobe 不可用，且没有在文件头/文件尾找到可解析的 MP4 轨道信息：${error.message || "未知错误"}`
         : `ffprobe 不可用，且没有找到可解析的 MP4 轨道信息：${error.message || "未知错误"}`;
-    mediaInfoCache.set(cacheKey, payload);
+    rememberMediaInfo(cacheKey, payload);
     cacheMediaInfo(target, targetStat, payload);
     return payload;
   }
@@ -2866,245 +2517,264 @@ function rememberWorkspacePayload(cacheKey, payload) {
   if (oldestKey) workspacePayloadCache.delete(oldestKey);
 }
 
-async function workspacePayload() {
-  if (!workspaceRoot) {
+function rememberMediaInfo(cacheKey, payload) {
+  mediaInfoCache.delete(cacheKey);
+  mediaInfoCache.set(cacheKey, payload);
+  while (mediaInfoCache.size > maxMediaInfoMemoryCacheItems) {
+    const oldestKey = mediaInfoCache.keys().next().value;
+    if (!oldestKey) break;
+    mediaInfoCache.delete(oldestKey);
+  }
+}
+
+async function workspacePayload(rootPath = workspaceRoot) {
+  const root = rootPath ? normalizeInputPath(rootPath) : "";
+  if (!root) {
     return { name: "", path: "", dirs: [], docs: [] };
   }
 
-  const rootStat = await stat(workspaceRoot);
+  const rootStat = await stat(root);
   if (!rootStat.isDirectory()) {
     throw new Error("路径不是文件夹");
   }
-  const cacheKey = workspacePayloadCacheKey(workspaceRoot, rootStat);
+  const cacheKey = workspacePayloadCacheKey(root, rootStat);
   const cached = workspacePayloadCache.get(cacheKey);
   if (cached) return cached;
 
-  const entries = await readdir(workspaceRoot, { withFileTypes: true });
+  const entries = await readdir(root, { withFileTypes: true });
   const payload = {
-    name: basename(workspaceRoot),
-    path: displayPath(workspaceRoot),
-    resolvedPath: workspaceRoot,
-    parentPath: workspaceRoot === parse(workspaceRoot).root ? "" : displayPath(dirname(workspaceRoot)),
-    dirs: listDirectories(workspaceRoot, entries),
-    docs: await listPreviewFiles(workspaceRoot, entries),
+    name: basename(root),
+    path: displayPath(root),
+    resolvedPath: root,
+    parentPath: root === parse(root).root ? "" : displayPath(dirname(root)),
+    dirs: listDirectories(root, entries),
+    docs: await listPreviewFiles(root, entries),
   };
   rememberWorkspacePayload(cacheKey, payload);
   return payload;
 }
 
-async function handleApi(request, response, url) {
-  if (url.pathname === "/api/login" && request.method === "POST") {
-    const body = new URLSearchParams(await readBody(request));
-    const next = safeNextPath(body.get("next") || "/");
-    if (!authEnabled()) {
-      response.writeHead(302, { location: next });
-      response.end();
-      return true;
-    }
-    const username = body.get("username") || "";
-    const password = body.get("password") || "";
-    if (verifyLogin(username, password)) {
-      createSession(response);
-      response.writeHead(302, { location: next });
-      response.end();
-    } else {
-      sendHtml(response, 401, loginPage("用户名或密码不正确", next));
-    }
-    return true;
-  }
-
-  if (url.pathname === "/api/logout" && request.method === "POST") {
-    clearSession(request, response);
-    response.writeHead(302, { location: "/login" });
-    response.end();
-    return true;
-  }
-
-  if (url.pathname === "/api/events" && request.method === "GET") {
-    response.writeHead(200, {
-      "cache-control": "no-cache",
-      "connection": "keep-alive",
-      "content-type": "text/event-stream",
-    });
-    response.write("event: connected\ndata: ok\n\n");
-    liveReloadClients.add(response);
-    request.on("close", () => liveReloadClients.delete(response));
-    return true;
-  }
-
-  if (url.pathname === "/api/workspace" && request.method === "GET") {
-    sendJson(response, 200, await workspacePayload());
-    return true;
-  }
-
-  if (url.pathname === "/api/workspace" && request.method === "POST") {
-    const body = await readBody(request);
-    const payload = JSON.parse(body || "{}");
-    workspaceRoot = payload.path ? normalizeInputPath(payload.path) : "";
-    await rememberWorkspace(workspaceRoot);
-    sendJson(response, 200, await workspacePayload());
-    return true;
-  }
-
-  if (url.pathname === "/api/document" && request.method === "GET") {
-    const path = url.searchParams.get("path") || "";
-    const rootPath = url.searchParams.get("dir") || "";
-    const metadata = await documentMetadata(path, rootPath);
-    const target = documentPath(path, rootPath);
-
-    if (metadata.kind === "image" || metadata.kind === "pdf" || metadata.kind === "audio" || metadata.kind === "video" || metadata.kind === "file") {
-      sendJson(response, 200, {
-        ...metadata,
-      });
-      return true;
-    }
-
-    sendJson(response, 200, {
-      ...metadata,
-      content: await readFile(target, "utf8"),
-    });
-    return true;
-  }
-
-  if (url.pathname === "/api/document-meta" && request.method === "GET") {
-    const path = url.searchParams.get("path") || "";
-    const rootPath = url.searchParams.get("dir") || "";
-    sendJson(response, 200, await documentMetadata(path, rootPath));
-    return true;
-  }
-
-  if (url.pathname === "/api/file-sizes" && request.method === "POST") {
-    const payload = JSON.parse(await readBody(request) || "{}");
-    sendJson(response, 200, await fileSizesPayload(payload.paths || [], payload.dir || ""));
-    return true;
-  }
-
-  if (url.pathname === "/api/thumbnails" && request.method === "POST") {
-    const payload = JSON.parse(await readBody(request) || "{}");
-    sendJson(response, 200, await thumbnailPayload(payload.paths || [], payload.dir || ""));
-    return true;
-  }
-
-  if (url.pathname === "/api/media-info" && request.method === "GET") {
-    const path = url.searchParams.get("path") || "";
-    const rootPath = url.searchParams.get("dir") || "";
-    sendJson(response, 200, await mediaInfoPayload(path, rootPath));
-    return true;
-  }
-
-  if (url.pathname === "/api/index-stats" && request.method === "GET") {
-    sendJson(response, 200, {
-      ...indexStatements.stats.get(),
-      dbPath: displayPath(join(configRoot, "komios.db")),
-      thumbnailRoot: displayPath(thumbnailRoot),
-    });
-    return true;
-  }
-
-  if (url.pathname === "/api/live-photo" && request.method === "GET") {
-    const path = url.searchParams.get("path") || "";
-    const rootPath = url.searchParams.get("dir") || "";
-    sendJson(response, 200, await livePhotoPayload(path, rootPath));
-    return true;
-  }
-
-  if (url.pathname === "/api/image-preview" && request.method === "GET") {
-    return handleImagePreview(request, response, url);
-  }
-
-  if (url.pathname === "/api/motion-video" && (request.method === "GET" || request.method === "HEAD")) {
-    return handleMotionVideo(request, response, url);
-  }
-
-  if (url.pathname === "/api/motion-video-transcode" && request.method === "GET") {
-    return handleMotionVideoTranscode(request, response, url);
-  }
-
-  if (url.pathname === "/api/video-state" && request.method === "GET") {
-    const path = url.searchParams.get("path") || "";
-    const rootPath = url.searchParams.get("dir") || "";
-    sendJson(response, 200, await readVideoState(path, rootPath));
-    return true;
-  }
-
-  if (url.pathname === "/api/video-state" && request.method === "POST") {
-    const payload = JSON.parse(await readBody(request) || "{}");
-    sendJson(response, 200, await writeVideoState(payload.path || "", payload, payload.dir || ""));
-    return true;
-  }
-
-  if (url.pathname === "/api/transcode" && request.method === "GET") {
-    return handleTranscode(request, response, url);
-  }
-
-  if (url.pathname.startsWith("/api/thumb/") && (request.method === "GET" || request.method === "HEAD")) {
-    const filename = decodeURIComponent(url.pathname.slice("/api/thumb/".length));
-    if (!/^[a-f0-9]{32}\.jpg$/i.test(filename)) throw new Error("缩略图路径无效");
-    const target = join(thumbnailRoot, filename);
-    const targetStat = await stat(target);
-    if (!targetStat.isFile()) throw new Error("缩略图不存在");
-    response.writeHead(200, {
-      "cache-control": "private, max-age=86400",
-      "content-length": targetStat.size,
-      "content-type": "image/jpeg",
-    });
-    if (request.method === "HEAD") response.end();
-    else createReadStream(target).pipe(response);
-    return true;
-  }
-
-  if (url.pathname.startsWith("/api/file/") && (request.method === "GET" || request.method === "HEAD")) {
-    const path = decodeURIComponent(url.pathname.slice("/api/file/".length));
-    const rootPath = url.searchParams.get("dir") || "";
-    const target = documentPath(path, rootPath);
-    const targetStat = await stat(target);
-    if (!targetStat.isFile()) {
-      throw new Error("不是文件");
-    }
-
-    const headers = fileHeaders(target, targetStat.size, url);
-    const rangeHeader = request.headers.range;
-    if (rangeHeader) {
-      const range = parseRangeHeader(rangeHeader, targetStat.size);
-      if (!range) {
-        response.writeHead(416, {
-          "accept-ranges": "bytes",
-          "content-range": `bytes */${targetStat.size}`,
-        });
-        response.end();
-        return true;
-      }
-
-      const partialHeaders = {
-        ...headers,
-        "content-length": range.end - range.start + 1,
-        "content-range": `bytes ${range.start}-${range.end}/${targetStat.size}`,
-      };
-      response.writeHead(206, partialHeaders);
-      if (request.method === "HEAD") {
-        response.end();
-      } else {
-        createReadStream(target, { start: range.start, end: range.end }).pipe(response);
-      }
-      return true;
-    }
-
-    response.writeHead(200, headers);
-    if (request.method === "HEAD") {
-      response.end();
-    } else {
-      createReadStream(target).pipe(response);
-    }
-    return true;
-  }
-
-  return false;
+function jsonPayloadFromUrl(url) {
+  return {
+    path: url.searchParams.get("path") || "",
+    rootPath: url.searchParams.get("dir") || "",
+  };
 }
+
+async function handleLoginRoute(request, response) {
+  const body = new URLSearchParams(await readBody(request));
+  const next = auth.safeNextPath(body.get("next") || "/");
+  if (!auth.isEnabled()) {
+    response.writeHead(302, { location: next });
+    response.end();
+    return;
+  }
+  const username = body.get("username") || "";
+  const password = body.get("password") || "";
+  if (auth.verifyLogin(username, password)) {
+    auth.createSession(response);
+    response.writeHead(302, { location: next });
+    response.end();
+  } else {
+    sendHtml(response, 401, auth.loginPage("用户名或密码不正确", next));
+  }
+}
+
+async function handleLogoutRoute(request, response) {
+  auth.clearSession(request, response);
+  response.writeHead(302, { location: "/login" });
+  response.end();
+}
+
+async function handleEventsRoute(request, response) {
+  response.writeHead(200, {
+    "cache-control": "no-cache",
+    "connection": "keep-alive",
+    "content-type": "text/event-stream",
+  });
+  response.write("event: connected\ndata: ok\n\n");
+  liveReloadClients.add(response);
+  request.on("close", () => liveReloadClients.delete(response));
+}
+
+async function handleWorkspaceGetRoute(request, response) {
+  const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+  sendJson(response, 200, await workspacePayload(url.searchParams.get("dir") || workspaceRoot));
+}
+
+async function handleWorkspacePostRoute(request, response) {
+  const body = await readBody(request);
+  const payload = JSON.parse(body || "{}");
+  workspaceRoot = payload.path ? normalizeInputPath(payload.path) : "";
+  if (payload.remember !== false) await rememberWorkspace(workspaceRoot);
+  sendJson(response, 200, await workspacePayload());
+}
+
+async function handleDocumentRoute(request, response, url) {
+  const { path, rootPath } = jsonPayloadFromUrl(url);
+  const metadata = await documentMetadata(path, rootPath);
+  const target = documentPath(path, rootPath);
+  if (["audio", "file", "image", "pdf", "video"].includes(metadata.kind)) {
+    sendJson(response, 200, { ...metadata });
+    return;
+  }
+  sendJson(response, 200, {
+    ...metadata,
+    content: await readFile(target, "utf8"),
+  });
+}
+
+async function handleDocumentMetaRoute(request, response, url) {
+  const { path, rootPath } = jsonPayloadFromUrl(url);
+  sendJson(response, 200, await documentMetadata(path, rootPath));
+}
+
+async function handleImageSizeRoute(request, response, url) {
+  const { path, rootPath } = jsonPayloadFromUrl(url);
+  sendJson(response, 200, await imageSizePayload(path, rootPath));
+}
+
+async function handleFileSizesRoute(request, response) {
+  const payload = JSON.parse(await readBody(request) || "{}");
+  sendJson(response, 200, await fileSizesPayload(payload.paths || [], payload.dir || ""));
+}
+
+async function handleThumbnailsRoute(request, response) {
+  const payload = JSON.parse(await readBody(request) || "{}");
+  if (String(request.headers.accept || "").includes("application/x-ndjson")) {
+    await sendThumbnailStream(response, payload.paths || [], payload.dir || "");
+  } else {
+    sendJson(response, 200, await thumbnailPayload(payload.paths || [], payload.dir || ""));
+  }
+}
+
+async function handleMediaInfoRoute(request, response, url) {
+  const { path, rootPath } = jsonPayloadFromUrl(url);
+  sendJson(response, 200, await mediaInfoPayload(path, rootPath));
+}
+
+async function handleIndexStatsRoute(request, response) {
+  sendJson(response, 200, {
+    ...indexStatements.stats.get(),
+    dbPath: displayPath(join(configRoot, "komios.db")),
+    thumbnailRoot: displayPath(thumbnailRoot),
+    thumbnailCache: {
+      ...await cacheDirectoryUsage(thumbnailRoot),
+      maxBytes: thumbnailCacheMaxBytes,
+    },
+    previewRoot: displayPath(previewRoot),
+    previewCache: {
+      ...await cacheDirectoryUsage(previewRoot),
+      maxBytes: previewCacheMaxBytes,
+      format: previewCacheFormat,
+      webpQuality: previewCacheFormat === "webp" ? previewWebpQuality : null,
+    },
+  });
+}
+
+async function handleLivePhotoRoute(request, response, url) {
+  const { path, rootPath } = jsonPayloadFromUrl(url);
+  sendJson(response, 200, await livePhotoPayload(path, rootPath));
+}
+
+async function handleVideoStateGetRoute(request, response, url) {
+  const { path, rootPath } = jsonPayloadFromUrl(url);
+  sendJson(response, 200, await readVideoState(path, rootPath));
+}
+
+async function handleVideoStatePostRoute(request, response) {
+  const payload = JSON.parse(await readBody(request) || "{}");
+  sendJson(response, 200, await writeVideoState(payload.path || "", payload, payload.dir || ""));
+}
+
+async function handleThumbAssetRoute(request, response, url) {
+  const filename = decodeURIComponent(url.pathname.slice("/api/thumb/".length));
+  if (!/^[a-f0-9]{32}\.jpg$/i.test(filename)) throw new Error("缩略图路径无效");
+  const target = join(thumbnailRoot, filename);
+  const targetStat = await stat(target);
+  if (!targetStat.isFile()) throw new Error("缩略图不存在");
+  await touchCacheFile(target);
+  response.writeHead(200, {
+    "cache-control": "private, max-age=86400",
+    "content-length": targetStat.size,
+    "content-type": "image/jpeg",
+  });
+  if (request.method === "HEAD") response.end();
+  else createReadStream(target).pipe(response);
+}
+
+async function handleFileAssetRoute(request, response, url) {
+  const path = decodeURIComponent(url.pathname.slice("/api/file/".length));
+  const rootPath = url.searchParams.get("dir") || "";
+  const target = documentPath(path, rootPath);
+  const targetStat = await stat(target);
+  if (!targetStat.isFile()) throw new Error("不是文件");
+
+  const headers = fileHeaders(target, targetStat.size, url);
+  const rangeHeader = request.headers.range;
+  if (rangeHeader) {
+    await sendFileRange(request, response, target, targetStat.size, headers, rangeHeader);
+    return;
+  }
+
+  response.writeHead(200, headers);
+  if (request.method === "HEAD") response.end();
+  else createReadStream(target).pipe(response);
+}
+
+async function sendFileRange(request, response, target, size, headers, rangeHeader) {
+  const range = parseRangeHeader(rangeHeader, size);
+  if (!range) {
+    response.writeHead(416, {
+      "accept-ranges": "bytes",
+      "content-range": `bytes */${size}`,
+    });
+    response.end();
+    return;
+  }
+
+  response.writeHead(206, {
+    ...headers,
+    "content-length": range.end - range.start + 1,
+    "content-range": `bytes ${range.start}-${range.end}/${size}`,
+  });
+  if (request.method === "HEAD") response.end();
+  else createReadStream(target, { start: range.start, end: range.end }).pipe(response);
+}
+
+const handleApi = createApiRouter({
+  exact: [
+    ["POST", "/api/login", handleLoginRoute],
+    ["POST", "/api/logout", handleLogoutRoute],
+    ["GET", "/api/events", handleEventsRoute],
+    ["GET", "/api/workspace", handleWorkspaceGetRoute],
+    ["POST", "/api/workspace", handleWorkspacePostRoute],
+    ["GET", "/api/document", handleDocumentRoute],
+    ["GET", "/api/document-meta", handleDocumentMetaRoute],
+    ["GET", "/api/image-size", handleImageSizeRoute],
+    ["POST", "/api/file-sizes", handleFileSizesRoute],
+    ["POST", "/api/thumbnails", handleThumbnailsRoute],
+    ["GET", "/api/media-info", handleMediaInfoRoute],
+    ["GET", "/api/index-stats", handleIndexStatsRoute],
+    ["GET", "/api/live-photo", handleLivePhotoRoute],
+    ["GET", "/api/image-preview", handleImagePreview],
+    ["GET", "/api/motion-video-transcode", handleMotionVideoTranscode],
+    ["GET", "/api/video-state", handleVideoStateGetRoute],
+    ["POST", "/api/video-state", handleVideoStatePostRoute],
+    ["GET", "/api/transcode", handleTranscode],
+  ],
+  dynamic: [
+    { matches: (url) => url.pathname === "/api/motion-video", methods: ["GET", "HEAD"], handler: handleMotionVideo },
+    { matches: (url) => url.pathname.startsWith("/api/thumb/"), methods: ["GET", "HEAD"], handler: handleThumbAssetRoute },
+    { matches: (url) => url.pathname.startsWith("/api/file/"), methods: ["GET", "HEAD"], handler: handleFileAssetRoute },
+  ],
+});
 
 async function handleStatic(response, pathname) {
   const target = normalize(join(appRoot, pathname === "/" ? "index.html" : pathname));
+  const pathFromRoot = relative(appRoot, target);
 
-  if (!target.startsWith(appRoot)) {
+  if (pathFromRoot.startsWith("..") || isAbsolute(pathFromRoot) || isPrivateStaticPath(pathFromRoot)) {
     response.writeHead(403, { "content-type": "text/plain;charset=utf-8" });
     response.end("Forbidden");
     return;
@@ -3123,23 +2793,28 @@ async function handleStatic(response, pathname) {
   createReadStream(target).pipe(response);
 }
 
+function isPrivateStaticPath(pathFromRoot) {
+  const [firstSegment = ""] = String(pathFromRoot).split(/[\\/]+/);
+  return firstSegment.startsWith(".") || privateStaticRoots.has(firstSegment);
+}
+
 createServer(async (request, response) => {
   const url = new URL(request.url || "/", `http://${request.headers.host}`);
 
   try {
     if (url.pathname === "/login" && request.method === "GET") {
-      const next = safeNextPath(url.searchParams.get("next") || "/");
-      if (isAuthenticated(request)) {
+      const next = auth.safeNextPath(url.searchParams.get("next") || "/");
+      if (auth.isAuthenticated(request)) {
         response.writeHead(302, { location: next });
         response.end();
       } else {
-        sendHtml(response, 200, loginPage("", next));
+        sendHtml(response, 200, auth.loginPage("", next));
       }
       return;
     }
 
-    if (url.pathname !== "/api/login" && !isAuthenticated(request)) {
-      rejectUnauthenticated(request, response, url);
+    if (url.pathname !== "/api/login" && !auth.isAuthenticated(request)) {
+      auth.rejectUnauthenticated(request, response, url);
       return;
     }
 
@@ -3158,5 +2833,9 @@ createServer(async (request, response) => {
   console.log(`Auth username: ${authState.username}`);
   console.log(`Auth: enabled from ${authState.source}`);
   console.log(`Config database: ${join(configRoot, "komios.db")}`);
+  console.log(`Thumbnail cache: ${thumbnailRoot} (max ${thumbnailCacheMaxBytes} bytes)`);
+  console.log(`Preview cache: ${previewRoot} (max ${previewCacheMaxBytes} bytes, ${previewCacheFormat}${previewCacheFormat === "webp" ? ` q${previewWebpQuality}` : ""})`);
+  scheduleCacheCleanup("thumbnails", thumbnailRoot, thumbnailCacheMaxBytes);
+  scheduleCacheCleanup("previews", previewRoot, previewCacheMaxBytes);
   setupLiveReload();
 });
