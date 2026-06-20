@@ -7,3 +7,4 @@ node_modules/
 test-fixtures/heic-*.jpg
 test-fixtures/preview-*.jpg
 test-fixtures/near-mov/
+.tmp-swipe-frames/
