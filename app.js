@@ -92,6 +92,7 @@ const els = {
   docPath: document.querySelector("#docPath"),
   docTitle: document.querySelector("#docTitle"),
   preview: document.querySelector("#preview"),
+  mobileDocActionsToggle: document.querySelector("#mobileDocActionsToggle"),
   htmlMode: document.querySelector("#htmlMode"),
   htmlSourceMode: document.querySelector("#htmlSourceMode"),
   htmlPreviewMode: document.querySelector("#htmlPreviewMode"),
@@ -111,6 +112,14 @@ async function apiFetch(input, init) {
     throw new Error("未登录");
   }
   return response;
+}
+
+async function loadFolderSnapshot(path) {
+  const params = new URLSearchParams({ dir: path || "" });
+  const response = await apiFetch(`/api/workspace?${params.toString()}`);
+  const payload = await response.json();
+  if (!response.ok || payload.error) throw new Error(payload.error || "读取目录失败");
+  return payload;
 }
 
 function pathStem(path = "") {
@@ -380,7 +389,16 @@ function renderFileList() {
   scrollActiveFileIntoView();
 }
 
-function renderPreview(doc = docs.find((item) => item.id === activeId) || filteredDocs()[0]) {
+function isSystemNoiseFile(doc) {
+  return Boolean(doc && /^(\.DS_Store|Thumbs\.db|desktop\.ini)$/i.test(doc.name || ""));
+}
+
+function defaultPreviewDoc() {
+  if (window.matchMedia?.("(max-width: 820px)")?.matches && !activeId) return null;
+  return docs.find((item) => item.id === activeId) || filteredDocs().find((doc) => !isSystemNoiseFile(doc));
+}
+
+function renderPreview(doc = defaultPreviewDoc()) {
   const renderVersion = ++previewRenderVersion;
   setPreviewMode(doc);
   if (!doc) {
@@ -400,6 +418,10 @@ function setPreviewMode(doc) {
   const asset = mediaAssetFor(doc);
   document.body.classList.toggle("video-mode", asset.isVideo);
   document.body.classList.toggle("photo-mode", asset.isPhoto);
+  document.body.classList.toggle("document-mode", Boolean(doc && !asset.isMediaShell && !asset.isPhoto));
+  document.body.classList.toggle("directory-mode", Boolean(!doc && currentWorkspacePath));
+  document.body.classList.toggle("html-mode", asset.previewKind === "html");
+  if (asset.previewKind !== "html") document.body.classList.remove("mobile-doc-actions-open");
   if (!asset.isPhoto) photoSwipe.setFullscreen(false);
   els.preview.classList.toggle("media-preview-shell", asset.isMediaShell);
   els.preview.classList.toggle("photo-preview-shell", asset.isPhoto);
@@ -722,7 +744,8 @@ function setWorkspace(payload) {
   updateAddress("");
   mobileOverlayHistory.rememberCurrentUrl();
   addRecentItem({ type: "dir", dir: currentWorkspacePath, name: workspaceName });
-  const targetDoc = docs.find((doc) => doc.path === pendingFilePath) || docs[0];
+  const mobileViewport = Boolean(window.matchMedia?.("(max-width: 820px)")?.matches);
+  const targetDoc = docs.find((doc) => doc.path === pendingFilePath) || (mobileViewport ? null : docs.find((doc) => !isSystemNoiseFile(doc)));
   pendingFilePath = "";
   if (targetDoc) selectDoc(targetDoc.id);
 }
@@ -971,7 +994,7 @@ const mobileOverlayHistory = (() => {
   let protectedUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
 
   function canUseOverlayHistory() {
-    return Boolean(photoSwipe?.isMobileViewport?.());
+    return Boolean(window.matchMedia?.("(max-width: 820px)")?.matches);
   }
 
   function currentUrl() {
@@ -985,7 +1008,10 @@ const mobileOverlayHistory = (() => {
 
   function pushGuard() {
     if (!canUseOverlayHistory()) return;
-    if (window.history.state?.komiosBackGuard) return;
+    if (window.history.state?.komiosBackGuard) {
+      window.history.replaceState(guardState(), "", protectedUrl);
+      return;
+    }
     window.history.pushState(guardState(), "", protectedUrl);
   }
 
@@ -1012,20 +1038,22 @@ const mobileOverlayHistory = (() => {
   }
 
   function handlePopState() {
-    if (!photoSwipe?.isMobileViewport?.()) return;
+    if (!canUseOverlayHistory()) return;
     if (mobileAlbum?.isOpen?.()) {
       consumingOverlayPop = true;
       mobileAlbum.setOpen(false, { history: false });
       consumingOverlayPop = false;
+      pushGuard();
       return;
     }
     if (photoSwipe?.isFullscreen?.()) {
       consumingOverlayPop = true;
       photoSwipe.setFullscreen(false, { history: false });
       consumingOverlayPop = false;
+      pushGuard();
       return;
     }
-    window.history.pushState(guardState(), "", protectedUrl);
+    pushGuard();
   }
 
   return { handlePopState, onOverlayChange, rememberCurrentUrl };
@@ -1050,13 +1078,15 @@ const mobileAlbum = createMobileAlbumController({
   escapeHtml,
   filteredDirs,
   folderDisplayName,
-  getState: () => ({ currentWorkspacePath, workspaceName, parentPath }),
+  getState: () => ({ activeId, currentWorkspacePath, docs, isPhotoMode: Boolean(currentDoc() && isImage(currentDoc())), workspaceName, parentPath }),
+  loadFolderSnapshot,
   onOpenChange: (open, options) => {
     mobileOverlayHistory.onOverlayChange("album-sheet", open, options);
   },
   openFolder,
   openRecentItem,
   readRecentItems,
+  selectDoc,
   setMobilePhotoFullscreen: photoSwipe.setFullscreen,
 });
 
@@ -1161,7 +1191,7 @@ els.preview.addEventListener("click", async (event) => {
       return;
     }
     event.preventDefault();
-    photoSwipe.toggleFullscreen();
+    photoSwipe.handlePhotoFrameClick(event);
     return;
   }
 
@@ -1202,12 +1232,25 @@ els.preview.addEventListener("click", async (event) => {
 
 els.htmlSourceMode.addEventListener("click", () => {
   htmlViewMode = "source";
+  document.body.classList.remove("mobile-doc-actions-open");
   renderPreview(currentDoc());
 });
 
 els.htmlPreviewMode.addEventListener("click", () => {
   htmlViewMode = "preview";
+  document.body.classList.remove("mobile-doc-actions-open");
   renderPreview(currentDoc());
+});
+
+els.mobileDocActionsToggle?.addEventListener("click", (event) => {
+  event.stopPropagation();
+  document.body.classList.toggle("mobile-doc-actions-open");
+});
+
+document.addEventListener("click", (event) => {
+  if (!document.body.classList.contains("mobile-doc-actions-open")) return;
+  if (event.target.closest?.(".preview-actions")) return;
+  document.body.classList.remove("mobile-doc-actions-open");
 });
 
 els.closeWorkspace.addEventListener("click", () => {

@@ -14,8 +14,14 @@ export function createPhotoSwipeController({
   let swipeStart = null;
   let swipeGesture = null;
   let pinchGesture = null;
+  let panGesture = null;
   let pinchState = { scale: 1, x: 0, y: 0 };
   let gestureResetTimer = null;
+  let edgeToastTimer = null;
+  let lastTap = null;
+  let lastClickTap = null;
+  let singleTapTimer = null;
+  let ignoreDblClickUntil = 0;
   const preloadedImages = new Map();
   const preloadInFlight = new Map();
   const preloadQueue = new Map();
@@ -31,16 +37,75 @@ export function createPhotoSwipeController({
     return document.body.classList.contains("mobile-photo-fullscreen");
   }
 
+  function clearLiveToolbarInsets() {
+    const frame = els.preview.querySelector("[data-motion-media-frame]");
+    if (!frame) return;
+    frame.style.removeProperty("--live-photo-content-left");
+    frame.style.removeProperty("--live-photo-content-top");
+    frame.style.removeProperty("--live-photo-content-right");
+    frame.style.removeProperty("--live-photo-content-bottom");
+  }
+
+  function restoreInlinePhotoLayout() {
+    clearLiveToolbarInsets();
+    els.preview.scrollTop = 0;
+    const previewPanel = els.preview.closest?.(".preview-panel");
+    if (previewPanel) previewPanel.scrollTop = 0;
+  }
+
+  function showEdgeToast(message) {
+    if (!isMobileViewport() || !message) return;
+    let toast = document.querySelector("[data-photo-edge-toast]");
+    if (!toast) {
+      toast = document.createElement("div");
+      toast.className = "photo-edge-toast";
+      toast.dataset.photoEdgeToast = "true";
+      toast.setAttribute("role", "status");
+      toast.setAttribute("aria-live", "polite");
+      document.body.append(toast);
+    }
+    toast.textContent = message;
+    toast.classList.add("is-visible");
+    if (edgeToastTimer) clearTimeout(edgeToastTimer);
+    edgeToastTimer = setTimeout(() => {
+      toast.classList.remove("is-visible");
+      edgeToastTimer = null;
+    }, 1300);
+  }
+
   function setFullscreen(enabled, options = {}) {
     const next = Boolean(enabled && isMobileViewport() && currentDoc() && isImage(currentDoc()));
     const previous = isFullscreen();
     document.body.classList.toggle("mobile-photo-fullscreen", next);
     resetPinchZoom();
+    if (previous && !next) {
+      requestAnimationFrame(() => {
+        restoreInlinePhotoLayout();
+        requestAnimationFrame(restoreInlinePhotoLayout);
+      });
+    }
     if (previous !== next) onFullscreenChange(next, options);
   }
 
   function toggleFullscreen() {
     setFullscreen(!isFullscreen(), { history: true });
+  }
+
+  function clearSingleTapTimer() {
+    if (!singleTapTimer) return;
+    clearTimeout(singleTapTimer);
+    singleTapTimer = null;
+  }
+
+  function rememberTap(point) {
+    if (!point) return;
+    lastTap = { x: point.x, y: point.y, time: Date.now() };
+  }
+
+  function isRecentTap(tap, point, maxDelay = 360, maxDistance = 34) {
+    if (!tap || !point) return false;
+    return Date.now() - tap.time < maxDelay
+      && Math.hypot(point.x - tap.x, point.y - tap.y) < maxDistance;
   }
 
   function slideImageMarkup(src, alt = "", marker = "") {
@@ -245,6 +310,7 @@ export function createPhotoSwipeController({
 
   function resetPinchZoom() {
     pinchGesture = null;
+    panGesture = null;
     pinchState = { scale: 1, x: 0, y: 0 };
     els.preview.querySelector("[data-live-photo-shell]")?.classList.remove("is-pinched-photo");
     for (const element of pinchMediaElements()) {
@@ -252,6 +318,36 @@ export function createPhotoSwipeController({
       element.style.transformOrigin = "";
       element.style.willChange = "";
     }
+  }
+
+  function isPinchedPhoto() {
+    return Boolean(els.preview.querySelector("[data-live-photo-shell]")?.classList.contains("is-pinched-photo"));
+  }
+
+  function toggleDoubleTapZoom(point = null) {
+    if (!currentDoc() || !isImage(currentDoc()) || transitioning) return;
+    clearSingleTapTimer();
+    const frame = els.preview.querySelector("[data-motion-media-frame]");
+    if (!frame) return;
+    if (pinchState.scale > 1.01 || isPinchedPhoto()) {
+      resetPinchZoom();
+      return;
+    }
+    const rect = frame.getBoundingClientRect();
+    const scale = 2.35;
+    const pointX = point ? point.x - rect.left - rect.width / 2 : 0;
+    const pointY = point ? point.y - rect.top - rect.height / 2 : 0;
+    applyPinchZoom({
+      scale,
+      x: clampPan(-pointX * (scale - 1), scale, rect.width || window.innerWidth),
+      y: clampPan(-pointY * (scale - 1), scale, rect.height || window.innerHeight),
+    });
+    suppressClickUntil = Date.now() + 450;
+  }
+
+  function handleDoubleTapZoom(point = null) {
+    ignoreDblClickUntil = Date.now() + 500;
+    toggleDoubleTapZoom(point);
   }
 
   function touchDistance(touches) {
@@ -272,11 +368,25 @@ export function createPhotoSwipeController({
     if (event.touches.length < 2) return false;
     event.preventDefault();
     clearTransitionState();
+    panGesture = null;
     const midpoint = touchMidpoint(event.touches);
     pinchGesture = {
       base: { ...pinchState },
       midpoint,
       distance: Math.max(1, touchDistance(event.touches)),
+    };
+    swipeStart = null;
+    swipeGesture = null;
+    return true;
+  }
+
+  function startPan(event) {
+    if (!isPinchedPhoto() || event.touches.length !== 1 || transitioning) return false;
+    const touch = event.touches[0];
+    panGesture = {
+      base: { ...pinchState },
+      startX: touch.clientX,
+      startY: touch.clientY,
     };
     swipeStart = null;
     swipeGesture = null;
@@ -305,6 +415,8 @@ export function createPhotoSwipeController({
       { doc: items[index + 1], priority: 80 },
       { doc: items[index - 2], priority: 60 },
       { doc: items[index + 2], priority: 60 },
+      { doc: index === 0 ? items[items.length - 1] : null, priority: 40 },
+      { doc: index === items.length - 1 ? items[0] : null, priority: 40 },
     ].filter((item) => item.doc).forEach((item) => {
       preloadImage(item.doc, { priority: item.priority });
     });
@@ -312,9 +424,15 @@ export function createPhotoSwipeController({
 
   function swipeTarget(deltaX, doc = currentDoc()) {
     const direction = deltaX < 0 ? 1 : -1;
-    const { previous, next } = imageSequenceState(doc);
-    const target = direction < 0 ? previous : next;
-    return { direction, target };
+    const { items, previous, next } = imageSequenceState(doc);
+    const directTarget = direction < 0 ? previous : next;
+    if (directTarget || items.length <= 1) return { direction, target: directTarget, wrapped: false };
+    const wrappedTarget = direction < 0 ? items[items.length - 1] : items[0];
+    return { direction, target: wrappedTarget, wrapped: Boolean(wrappedTarget) };
+  }
+
+  function edgeMessageForDirection(direction) {
+    return direction < 0 ? "已经是第一张" : "已经是最后一张";
   }
 
   function createSlideTrack(direction, target) {
@@ -402,8 +520,12 @@ export function createPhotoSwipeController({
     const deltaX = end.x - start.x;
     const deltaY = end.y - start.y;
     if (Math.abs(deltaX) < 52 || Math.abs(deltaX) < Math.abs(deltaY) * 1.25) return;
-    const { direction, target } = swipeTarget(deltaX, doc);
-    if (!target) return;
+    const { direction, target, wrapped } = swipeTarget(deltaX, doc);
+    if (!target) {
+      showEdgeToast(edgeMessageForDirection(direction));
+      return;
+    }
+    if (wrapped) showEdgeToast(edgeMessageForDirection(direction));
     if (isMobileViewport()) animateTransition(direction, target);
     else selectDoc(target.id);
   }
@@ -416,6 +538,7 @@ export function createPhotoSwipeController({
     if (transitioning && !els.preview.querySelector(".photo-slide-track")) {
       clearTransitionState();
     }
+    if (startPan(event)) return;
     if (event.touches.length !== 1 || !currentDoc() || !isImage(currentDoc()) || transitioning) {
       swipeStart = null;
       swipeGesture = null;
@@ -442,19 +565,31 @@ export function createPhotoSwipeController({
       suppressClickUntil = Date.now() + 450;
       return;
     }
+    if (panGesture && event.touches.length === 1) {
+      event.preventDefault();
+      const touch = event.touches[0];
+      applyPinchZoom({
+        scale: panGesture.base.scale,
+        x: panGesture.base.x + touch.clientX - panGesture.startX,
+        y: panGesture.base.y + touch.clientY - panGesture.startY,
+      });
+      suppressClickUntil = Date.now() + 450;
+      return;
+    }
     if (!swipeStart || event.touches.length !== 1) return;
     const doc = currentDoc();
     if (!doc || !isImage(doc)) return;
     if (els.preview.querySelector("[data-live-photo-shell]")?.classList.contains("is-zoomed-photo")) return;
-    if (els.preview.querySelector("[data-live-photo-shell]")?.classList.contains("is-pinched-photo")) return;
+    if (isPinchedPhoto()) return;
     const touch = event.touches[0];
     const deltaX = touch.clientX - swipeStart.x;
     const deltaY = touch.clientY - swipeStart.y;
     if (!swipeGesture) {
       if (Math.abs(deltaX) < 10) return;
       if (Math.abs(deltaX) < Math.abs(deltaY) * 1.1) return;
-      const { direction, target } = swipeTarget(deltaX, doc);
+      const { direction, target, wrapped } = swipeTarget(deltaX, doc);
       if (!target) return;
+      if (wrapped) showEdgeToast(edgeMessageForDirection(direction));
       const slide = createSlideTrack(direction, target);
       if (!slide) return;
       swipeGesture = { ...slide, direction, target, latestDeltaX: deltaX };
@@ -482,6 +617,11 @@ export function createPhotoSwipeController({
       if (pinchState.scale < 1.04) resetPinchZoom();
       return;
     }
+    if (panGesture) {
+      suppressClickUntil = Date.now() + 450;
+      panGesture = null;
+      return;
+    }
     if (!swipeStart || !event.changedTouches.length) {
       if (swipeGesture) clearTransitionState();
       return;
@@ -492,6 +632,15 @@ export function createPhotoSwipeController({
     const end = { x: touch.clientX, y: touch.clientY };
     const start = swipeStart;
     swipeStart = null;
+    const movedDistance = Math.hypot(end.x - start.x, end.y - start.y);
+    if (elapsed < 260 && movedDistance < 12) {
+      if (isRecentTap(lastTap, end)) {
+        lastTap = null;
+        handleDoubleTapZoom(end);
+        return;
+      }
+      rememberTap(end);
+    }
     if (swipeGesture) {
       const { direction, target, track, frame, ready, width, latestDeltaX } = swipeGesture;
       swipeGesture = null;
@@ -528,11 +677,33 @@ export function createPhotoSwipeController({
 
   function onTouchCancel() {
     pinchGesture = null;
+    panGesture = null;
     clearTransitionState();
   }
 
   function suppressesClick() {
     return Date.now() < suppressClickUntil;
+  }
+
+  function handlePhotoFrameClick(event = null) {
+    if (!isMobileViewport() || !currentDoc() || !isImage(currentDoc())) return false;
+    if (suppressesClick()) return true;
+    if (isPinchedPhoto()) return true;
+    const point = event ? { x: event.clientX, y: event.clientY } : null;
+    // Touch, synthetic click, and browser dblclick can all fire for one gesture; arbitrate here so single tap fullscreen does not steal double tap zoom.
+    if (isRecentTap(lastClickTap, point, 420, 42)) {
+      lastClickTap = null;
+      clearSingleTapTimer();
+      handleDoubleTapZoom(point);
+      return true;
+    }
+    if (point) lastClickTap = { ...point, time: Date.now() };
+    clearSingleTapTimer();
+    singleTapTimer = setTimeout(() => {
+      singleTapTimer = null;
+      if (!isPinchedPhoto() && currentDoc() && isImage(currentDoc())) toggleFullscreen();
+    }, 260);
+    return true;
   }
 
   function bind() {
@@ -542,6 +713,13 @@ export function createPhotoSwipeController({
     els.preview.addEventListener("touchcancel", onTouchCancel, { passive: true });
     els.preview.addEventListener("gesturestart", (event) => event.preventDefault(), { passive: false });
     els.preview.addEventListener("gesturechange", (event) => event.preventDefault(), { passive: false });
+    els.preview.addEventListener("dblclick", (event) => {
+      const frame = event.target.closest?.("[data-motion-media-frame]");
+      if (!frame || !currentDoc() || !isImage(currentDoc())) return;
+      event.preventDefault();
+      if (Date.now() < ignoreDblClickUntil) return;
+      toggleDoubleTapZoom({ x: event.clientX, y: event.clientY });
+    });
     window.addEventListener("touchend", onTouchEnd, { passive: true, capture: true });
     window.addEventListener("touchcancel", onTouchCancel, { passive: true, capture: true });
     window.addEventListener("resize", () => {
@@ -552,6 +730,7 @@ export function createPhotoSwipeController({
   return {
     bind,
     handleSwipe,
+    handlePhotoFrameClick,
     getPreloadedImageUrl: preloadedImageUrl,
     isFullscreen,
     isMobileViewport,

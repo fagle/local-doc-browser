@@ -334,6 +334,14 @@ export function createLivePhotoController({
 
   function syncLiveToolbarInsets(image, frame) {
     if (!image?.naturalWidth || !image?.naturalHeight || !frame) return;
+    const mobilePhotoMode = window.matchMedia?.("(max-width: 820px)")?.matches && document.body.classList.contains("photo-mode");
+    if (mobilePhotoMode && !document.body.classList.contains("mobile-photo-fullscreen")) {
+      frame.style.removeProperty("--live-photo-content-left");
+      frame.style.removeProperty("--live-photo-content-top");
+      frame.style.removeProperty("--live-photo-content-right");
+      frame.style.removeProperty("--live-photo-content-bottom");
+      return;
+    }
     const rect = frame.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
     const imageRatio = image.naturalWidth / image.naturalHeight;
