@@ -271,7 +271,10 @@ export function createLivePhotoController({
     }
 
     shell.classList.add("has-live-photo");
-    const badgeLabel = info.mode === "embedded-motion-photo" ? "Motion" : "Live";
+    const mobilePhotoViewport = Boolean(window.matchMedia?.("(max-width: 820px)")?.matches);
+    const badgeLabel = mobilePhotoViewport
+      ? "实况"
+      : (info.mode === "embedded-motion-photo" ? "Motion" : "Live");
     const badgeTitle = info.message || "播放动态照片";
     toolbar.hidden = false;
     toolbar.innerHTML = `
@@ -299,7 +302,6 @@ export function createLivePhotoController({
     });
     const frame = shell.querySelector("[data-motion-media-frame]");
     if (frame) {
-      const mobilePhotoViewport = Boolean(window.matchMedia?.("(max-width: 820px)")?.matches);
       frame.classList.toggle("is-interactive-motion", !mobilePhotoViewport);
       frame.tabIndex = mobilePhotoViewport ? -1 : 0;
       frame.title = mobilePhotoViewport
@@ -320,6 +322,37 @@ export function createLivePhotoController({
     return true;
   }
 
+  function applyLivePhotoDetectingControl(toolbar) {
+    if (!toolbar) return;
+    toolbar.hidden = false;
+    toolbar.innerHTML = `
+      <span class="live-photo-badge is-detecting" title="正在检测动态照片" aria-label="正在检测动态照片">
+        <span class="live-photo-play-icon" aria-hidden="true"></span>
+      </span>
+    `;
+  }
+
+  function syncLiveToolbarInsets(image, frame) {
+    if (!image?.naturalWidth || !image?.naturalHeight || !frame) return;
+    const rect = frame.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const imageRatio = image.naturalWidth / image.naturalHeight;
+    const frameRatio = rect.width / rect.height;
+    let contentWidth = rect.width;
+    let contentHeight = rect.height;
+    if (imageRatio > frameRatio) {
+      contentHeight = rect.width / imageRatio;
+    } else {
+      contentWidth = rect.height * imageRatio;
+    }
+    const left = Math.max(0, (rect.width - contentWidth) / 2);
+    const top = Math.max(0, (rect.height - contentHeight) / 2);
+    frame.style.setProperty("--live-photo-content-left", `${left.toFixed(2)}px`);
+    frame.style.setProperty("--live-photo-content-top", `${top.toFixed(2)}px`);
+    frame.style.setProperty("--live-photo-content-right", `${left.toFixed(2)}px`);
+    frame.style.setProperty("--live-photo-content-bottom", `${top.toFixed(2)}px`);
+  }
+
   function bindImagePreviewLifecycle({ doc, image, frame, shell, toolbar, renderVersion }) {
     const optimisticInfo = optimisticLivePhotoInfo(doc);
     if (optimisticInfo) doc.livePhotoInfo = optimisticInfo;
@@ -332,14 +365,20 @@ export function createLivePhotoController({
 
     let liveControlsShown = false;
     let imageLoadHandled = false;
+    let liveInfoSettled = false;
     const isCurrentRender = () => renderVersion === getPreviewRenderVersion() && currentDoc()?.id === doc.id;
     const showLiveControls = (info) => {
       if (!imageLoadHandled || liveControlsShown || !info?.isLive || !shell || !toolbar || !isCurrentRender()) return;
       liveControlsShown = applyLivePhotoControls(shell, toolbar, info);
     };
+    const showDetectingControl = () => {
+      if (!imageLoadHandled || liveControlsShown || liveInfoSettled || optimisticInfo || !toolbar || !isCurrentRender()) return;
+      applyLivePhotoDetectingControl(toolbar);
+    };
     const syncFrame = () => {
       if (!image?.naturalWidth || !image?.naturalHeight || !frame) return;
       frame.style.setProperty("--media-aspect-ratio", String(image.naturalWidth / image.naturalHeight));
+      syncLiveToolbarInsets(image, frame);
     };
     const finishImageLoad = () => {
       if (imageLoadHandled) return;
@@ -347,9 +386,17 @@ export function createLivePhotoController({
       syncFrame();
       frame?.classList.remove("is-loading-preview");
       showLiveControls(optimisticInfo || doc.livePhotoInfo);
+      showDetectingControl();
     };
 
-    liveInfoPromise.then(showLiveControls);
+    liveInfoPromise.then((info) => {
+      liveInfoSettled = true;
+      if (!info?.isLive && !liveControlsShown && toolbar && isCurrentRender()) {
+        toolbar.hidden = true;
+        toolbar.innerHTML = "";
+      }
+      showLiveControls(info);
+    });
     image?.addEventListener("load", finishImageLoad, { once: true });
     image?.addEventListener("error", () => {
       const fallbackUrl = jpegPreviewFallbackUrl(image?.getAttribute("src") || "");
@@ -373,6 +420,18 @@ export function createLivePhotoController({
         finishImageLoad();
       }
     }, 80);
+    frame?.__livePhotoResizeObserver?.disconnect?.();
+    if (frame && window.ResizeObserver) {
+      const resizeObserver = new ResizeObserver(() => {
+        if (!isCurrentRender()) {
+          resizeObserver.disconnect();
+          return;
+        }
+        syncLiveToolbarInsets(image, frame);
+      });
+      frame.__livePhotoResizeObserver = resizeObserver;
+      resizeObserver.observe(frame);
+    }
   }
 
   return {

@@ -13,6 +13,8 @@ export function createPhotoSwipeController({
   let suppressClickUntil = 0;
   let swipeStart = null;
   let swipeGesture = null;
+  let pinchGesture = null;
+  let pinchState = { scale: 1, x: 0, y: 0 };
   let gestureResetTimer = null;
   const preloadedImages = new Map();
   const preloadInFlight = new Map();
@@ -33,6 +35,7 @@ export function createPhotoSwipeController({
     const next = Boolean(enabled && isMobileViewport() && currentDoc() && isImage(currentDoc()));
     const previous = isFullscreen();
     document.body.classList.toggle("mobile-photo-fullscreen", next);
+    resetPinchZoom();
     if (previous !== next) onFullscreenChange(next, options);
   }
 
@@ -210,6 +213,76 @@ export function createPhotoSwipeController({
     transitioning = false;
   }
 
+  function pinchMediaElements() {
+    const frame = els.preview.querySelector("[data-motion-media-frame]");
+    if (!frame) return [];
+    return [...frame.querySelectorAll(":scope > img[data-live-photo-image], :scope > video[data-live-photo-video], :scope > .live-photo-player")];
+  }
+
+  function clampPan(value, scale, viewportSize) {
+    if (scale <= 1) return 0;
+    const max = Math.max(0, (viewportSize * (scale - 1)) / 2);
+    return Math.max(-max, Math.min(max, value));
+  }
+
+  function applyPinchZoom(state = pinchState) {
+    const frame = els.preview.querySelector("[data-motion-media-frame]");
+    const shell = els.preview.querySelector("[data-live-photo-shell]");
+    if (!frame) return;
+    const rect = frame.getBoundingClientRect();
+    const scale = Math.max(1, Math.min(4, state.scale || 1));
+    const x = clampPan(state.x || 0, scale, rect.width || window.innerWidth);
+    const y = clampPan(state.y || 0, scale, rect.height || window.innerHeight);
+    pinchState = { scale, x, y };
+    const active = scale > 1.01;
+    shell?.classList.toggle("is-pinched-photo", active);
+    for (const element of pinchMediaElements()) {
+      element.style.transformOrigin = "center center";
+      element.style.transform = active ? `translate3d(${x}px, ${y}px, 0) scale(${scale})` : "";
+      element.style.willChange = active ? "transform" : "";
+    }
+  }
+
+  function resetPinchZoom() {
+    pinchGesture = null;
+    pinchState = { scale: 1, x: 0, y: 0 };
+    els.preview.querySelector("[data-live-photo-shell]")?.classList.remove("is-pinched-photo");
+    for (const element of pinchMediaElements()) {
+      element.style.transform = "";
+      element.style.transformOrigin = "";
+      element.style.willChange = "";
+    }
+  }
+
+  function touchDistance(touches) {
+    const [a, b] = touches;
+    return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+  }
+
+  function touchMidpoint(touches) {
+    const [a, b] = touches;
+    return {
+      x: (a.clientX + b.clientX) / 2,
+      y: (a.clientY + b.clientY) / 2,
+    };
+  }
+
+  function startPinch(event) {
+    if (!isMobileViewport() || !currentDoc() || !isImage(currentDoc()) || transitioning) return false;
+    if (event.touches.length < 2) return false;
+    event.preventDefault();
+    clearTransitionState();
+    const midpoint = touchMidpoint(event.touches);
+    pinchGesture = {
+      base: { ...pinchState },
+      midpoint,
+      distance: Math.max(1, touchDistance(event.touches)),
+    };
+    swipeStart = null;
+    swipeGesture = null;
+    return true;
+  }
+
   function armGestureReset() {
     if (gestureResetTimer) clearTimeout(gestureResetTimer);
     gestureResetTimer = setTimeout(() => {
@@ -325,6 +398,7 @@ export function createPhotoSwipeController({
     const doc = currentDoc();
     if (!doc || !isImage(doc) || !start || !end) return;
     if (els.preview.querySelector("[data-live-photo-shell]")?.classList.contains("is-zoomed-photo")) return;
+    if (els.preview.querySelector("[data-live-photo-shell]")?.classList.contains("is-pinched-photo")) return;
     const deltaX = end.x - start.x;
     const deltaY = end.y - start.y;
     if (Math.abs(deltaX) < 52 || Math.abs(deltaX) < Math.abs(deltaY) * 1.25) return;
@@ -335,6 +409,7 @@ export function createPhotoSwipeController({
   }
 
   function onTouchStart(event) {
+    if (startPinch(event)) return;
     if (!transitioning && els.preview.querySelector(".photo-slide-track")) {
       clearTransitionState();
     }
@@ -352,10 +427,26 @@ export function createPhotoSwipeController({
   }
 
   function onTouchMove(event) {
+    if (pinchGesture || event.touches.length >= 2) {
+      if (!pinchGesture && !startPinch(event)) return;
+      if (!pinchGesture || event.touches.length < 2) return;
+      event.preventDefault();
+      const nextDistance = Math.max(1, touchDistance(event.touches));
+      const nextMidpoint = touchMidpoint(event.touches);
+      const scale = Math.max(1, Math.min(4, pinchGesture.base.scale * (nextDistance / pinchGesture.distance)));
+      applyPinchZoom({
+        scale,
+        x: pinchGesture.base.x + nextMidpoint.x - pinchGesture.midpoint.x,
+        y: pinchGesture.base.y + nextMidpoint.y - pinchGesture.midpoint.y,
+      });
+      suppressClickUntil = Date.now() + 450;
+      return;
+    }
     if (!swipeStart || event.touches.length !== 1) return;
     const doc = currentDoc();
     if (!doc || !isImage(doc)) return;
     if (els.preview.querySelector("[data-live-photo-shell]")?.classList.contains("is-zoomed-photo")) return;
+    if (els.preview.querySelector("[data-live-photo-shell]")?.classList.contains("is-pinched-photo")) return;
     const touch = event.touches[0];
     const deltaX = touch.clientX - swipeStart.x;
     const deltaY = touch.clientY - swipeStart.y;
@@ -384,6 +475,13 @@ export function createPhotoSwipeController({
   }
 
   function onTouchEnd(event) {
+    if (pinchGesture) {
+      suppressClickUntil = Date.now() + 450;
+      if (event.touches.length >= 2) return;
+      pinchGesture = null;
+      if (pinchState.scale < 1.04) resetPinchZoom();
+      return;
+    }
     if (!swipeStart || !event.changedTouches.length) {
       if (swipeGesture) clearTransitionState();
       return;
@@ -429,6 +527,7 @@ export function createPhotoSwipeController({
   }
 
   function onTouchCancel() {
+    pinchGesture = null;
     clearTransitionState();
   }
 
@@ -437,10 +536,12 @@ export function createPhotoSwipeController({
   }
 
   function bind() {
-    els.preview.addEventListener("touchstart", onTouchStart, { passive: true });
+    els.preview.addEventListener("touchstart", onTouchStart, { passive: false });
     els.preview.addEventListener("touchmove", onTouchMove, { passive: false });
     els.preview.addEventListener("touchend", onTouchEnd, { passive: true });
     els.preview.addEventListener("touchcancel", onTouchCancel, { passive: true });
+    els.preview.addEventListener("gesturestart", (event) => event.preventDefault(), { passive: false });
+    els.preview.addEventListener("gesturechange", (event) => event.preventDefault(), { passive: false });
     window.addEventListener("touchend", onTouchEnd, { passive: true, capture: true });
     window.addEventListener("touchcancel", onTouchCancel, { passive: true, capture: true });
     window.addEventListener("resize", () => {
